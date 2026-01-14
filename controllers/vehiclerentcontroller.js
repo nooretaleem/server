@@ -7,19 +7,22 @@ exports.getVehicleRents = async (req, res) => {
             SELECT 
                 vr.id,
                 vr.trip_id,
+                vr.transactionID,
                 vr.vehicle_id,
                 vr.distance_km,
                 vr.rent_per_km,
                 vr.total_rent,
-                vr.payment_source,
-                vr.created_at,
-                vr.updated_at,
+                vr.CB,
+                vr.CD,
+                vr.MD,
+                vr.Active,
                 t.trip_no,
                 v.number as vehicle_number
             FROM vehicle_rent vr
             LEFT JOIN trips t ON vr.trip_id = t.id
             LEFT JOIN vehicles v ON vr.vehicle_id = v.id
-            ORDER BY vr.created_at DESC
+            WHERE vr.Active = 1
+            ORDER BY vr.CD DESC
         `;
         const [rows] = await db.execute(query);
         res.json(rows);
@@ -43,13 +46,23 @@ exports.getVehicleRentById = async (req, res) => {
 
         const query = `
             SELECT 
-                vr.*,
+                vr.id,
+                vr.trip_id,
+                vr.transactionID,
+                vr.vehicle_id,
+                vr.distance_km,
+                vr.rent_per_km,
+                vr.total_rent,
+                vr.CB,
+                vr.CD,
+                vr.MD,
+                vr.Active,
                 t.trip_no,
                 v.number as vehicle_number
             FROM vehicle_rent vr
             LEFT JOIN trips t ON vr.trip_id = t.id
             LEFT JOIN vehicles v ON vr.vehicle_id = v.id
-            WHERE vr.id = ?
+            WHERE vr.id = ? AND vr.Active = 1
         `;
         const [rows] = await db.execute(query, [id]);
         
@@ -102,7 +115,7 @@ exports.getVehicleRentByTripId = async (req, res) => {
             FROM vehicle_rent vr
             LEFT JOIN trips t ON vr.trip_id = t.id
             LEFT JOIN vehicles v ON vr.vehicle_id = v.id
-            WHERE vr.trip_id = ?
+            WHERE vr.trip_id = ? AND vr.Active = 1
         `;
         const [rows] = await db.execute(query, [tripId]);
         
@@ -142,11 +155,12 @@ exports.addVehicleRent = async (req, res) => {
 
         await connection.beginTransaction();
 
-        // 1. Insert into vehicle_rent table (without payment_source)
+        // 1. Insert into vehicle_rent table (transactionID will be updated after transaction is created)
+        const username = req.user?.username || 'system';
         const query = `
             INSERT INTO vehicle_rent 
-            (trip_id, vehicle_id, distance_km, rent_per_km, total_rent, created_at, updated_at) 
-            VALUES (?, ?, ?, ?, ?, NOW(), NOW())
+            (trip_id, vehicle_id, distance_km, rent_per_km, total_rent, transactionID, CB, CD, MD, Active) 
+            VALUES (?, ?, ?, ?, ?, NULL, ?, NOW(), NOW(), 1)
         `;
 
         const [result] = await connection.execute(query, [
@@ -154,7 +168,8 @@ exports.addVehicleRent = async (req, res) => {
             vehicle_id,
             distance_km,
             rent_per_km,
-            total_rent
+            total_rent,
+            username
         ]);
 
         const vehicleRentId = result.insertId;
@@ -187,12 +202,17 @@ exports.addVehicleRent = async (req, res) => {
             const cashInHandId = cashInHandResult.insertId;
 
             // Insert into transactions
-            await connection.execute(`
+            const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     cash_in_hand_id, AccountID, Purpose, Debit, Credit, 
                     PaymentMode, Date, CD, MD, active
                 ) VALUES (?, NULL, ?, 0, ?, 'Cash', NOW(), NOW(), NOW(), 1)
             `, [cashInHandId, purpose, total_rent]);
+
+            // Update vehicle_rent with transactionID
+            await connection.execute(`
+                UPDATE vehicle_rent SET transactionID = ? WHERE id = ?
+            `, [transactionResult.insertId, vehicleRentId]);
 
         } else if (payment_source === 'bank') {
             // Bank payment - credit account
@@ -222,12 +242,17 @@ exports.addVehicleRent = async (req, res) => {
             `, [total_rent, account_id]);
 
             // Insert into transactions
-            await connection.execute(`
+            const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     AccountID, cash_in_hand_id, Purpose, Debit, Credit,
                     PaymentMode, Date, CD, MD, active
                 ) VALUES (?, NULL, ?, 0, ?, 'Bank', NOW(), NOW(), NOW(), 1)
             `, [account_id, purpose, total_rent]);
+
+            // Update vehicle_rent with transactionID
+            await connection.execute(`
+                UPDATE vehicle_rent SET transactionID = ? WHERE id = ?
+            `, [transactionResult.insertId, vehicleRentId]);
         }
 
         await connection.commit();
@@ -281,7 +306,7 @@ exports.updateVehicleRent = async (req, res) => {
 
         // 1. Get old vehicle rent data to reverse old transactions
         const [oldRentRows] = await connection.execute(
-            'SELECT * FROM vehicle_rent WHERE id = ?',
+            'SELECT * FROM vehicle_rent WHERE id = ? AND Active = 1',
             [id]
         );
 
@@ -357,8 +382,8 @@ exports.updateVehicleRent = async (req, res) => {
                 distance_km = ?,
                 rent_per_km = ?,
                 total_rent = ?,
-                updated_at = NOW()
-            WHERE id = ?
+                MD = NOW()
+            WHERE id = ? AND Active = 1
         `, [trip_id, vehicle_id, distance_km, rent_per_km, total_rent, id]);
 
         // 5. Get new trip number for new transaction
@@ -388,12 +413,17 @@ exports.updateVehicleRent = async (req, res) => {
             const cashInHandId = cashInHandResult.insertId;
 
             // Insert into transactions
-            await connection.execute(`
+            const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     cash_in_hand_id, AccountID, Purpose, Debit, Credit, 
                     PaymentMode, Date, CD, MD, active
                 ) VALUES (?, NULL, ?, 0, ?, 'Cash', NOW(), NOW(), NOW(), 1)
             `, [cashInHandId, newPurpose, total_rent]);
+
+            // Update vehicle_rent with transactionID
+            await connection.execute(`
+                UPDATE vehicle_rent SET transactionID = ? WHERE id = ?
+            `, [transactionResult.insertId, id]);
 
         } else if (payment_source === 'bank') {
             // Bank payment - credit account
@@ -423,12 +453,17 @@ exports.updateVehicleRent = async (req, res) => {
             `, [total_rent, account_id]);
 
             // Insert into transactions
-            await connection.execute(`
+            const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     AccountID, cash_in_hand_id, Purpose, Debit, Credit,
                     PaymentMode, Date, CD, MD, active
                 ) VALUES (?, NULL, ?, 0, ?, 'Bank', NOW(), NOW(), NOW(), 1)
             `, [account_id, newPurpose, total_rent]);
+
+            // Update vehicle_rent with transactionID
+            await connection.execute(`
+                UPDATE vehicle_rent SET transactionID = ? WHERE id = ?
+            `, [transactionResult.insertId, id]);
         }
 
         await connection.commit();
@@ -456,7 +491,7 @@ exports.deleteVehicleRent = async (req, res) => {
 
         // 1. Get vehicle rent data to find and reverse transactions
         const [rentRows] = await connection.execute(
-            'SELECT * FROM vehicle_rent WHERE id = ?',
+            'SELECT * FROM vehicle_rent WHERE id = ? AND Active = 1',
             [id]
         );
 
@@ -524,8 +559,12 @@ exports.deleteVehicleRent = async (req, res) => {
             }
         }
 
-        // 4. Delete vehicle rent record
-        await connection.execute('DELETE FROM vehicle_rent WHERE id = ?', [id]);
+        // 4. Soft delete vehicle rent record (set Active = 0)
+        await connection.execute(`
+            UPDATE vehicle_rent 
+            SET Active = 0, MD = NOW()
+            WHERE id = ?
+        `, [id]);
 
         await connection.commit();
         connection.release();

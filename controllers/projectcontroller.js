@@ -641,15 +641,14 @@ exports.getDashboardData = async (req, res) => {
             console.error('Error details:', err.message);
         }
 
-        // 7. Get Total Rent Paid Today (from transactions table)
+        // 7. Get Total Rent Paid Today (from vehicle_rent table)
         let totalRentPaidToday = 0;
         try {
             const [rentRows] = await db.execute(`
-                SELECT COALESCE(SUM(Credit), 0) as total
-                FROM transactions
-                WHERE (Purpose LIKE '%Vehicle Rent Payment%' OR Purpose LIKE '%Vehicle Rent%' OR Purpose LIKE '%Tanker Rental%')
-                  AND DATE(Date) = CURDATE()
-                  AND active = 1
+                SELECT COALESCE(SUM(total_rent), 0) as total
+                FROM vehicle_rent
+                WHERE DATE(CD) = CURDATE()
+                  AND Active = 1
             `);
             totalRentPaidToday = parseFloat(rentRows[0]?.total || 0);
         } catch (err) {
