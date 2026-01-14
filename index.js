@@ -9,7 +9,21 @@ const bodyParser = require('body-parser');
 
 
 // Middleware
-app.use(cors());
+// CORS configuration to allow frontend origin
+const corsOptions = {
+  origin: [
+    'http://localhost:4200',
+    'http://localhost:5000',
+    'https://zeeshanpetrolium.vercel.app',
+    'https://www.zeeshanpetrolium.vercel.app'
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
