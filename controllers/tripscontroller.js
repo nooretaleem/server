@@ -1021,10 +1021,10 @@ exports.addTrip = async (req, res) => {
                 try {
                     const insertProductQuery = `
                         INSERT INTO trip_products (
-                            trip_id, comp_id, depo_id, product_type, quantity_ltr, invoice_rate, discount,
+                            trip_id, comp_id, depo_id, pickup_id, product_type, quantity_ltr, invoice_rate, discount,
                             container_type, container_liters, no_of_containers,
                             CB, CD, MD, Active
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)
                     `;
                     
                     // Initialize array for this trip
@@ -1054,6 +1054,7 @@ exports.addTrip = async (req, res) => {
                             tripInsertId,
                             companyId,  // comp_id (company_id)
                             product.depo_id,
+                            product.pick_up_location_id || null,  // pickup_id
                             product.product_type,
                             parseFloat(product.quantity_ltr),
                             invoiceRate,
@@ -2533,6 +2534,8 @@ exports.getTripProductDetails = async (req, res) => {
                 tp.depo_id,
                 d.name as depo_name,
                 c.name as company_name,
+                tp.pickup_id,
+                pul.name as pick_up_location_name,
                 tp.product_type,
                 tp.quantity_ltr,
                 tp.invoice_rate,
@@ -2546,6 +2549,7 @@ exports.getTripProductDetails = async (req, res) => {
             INNER JOIN depo d ON tp.depo_id = d.id AND d.active = 1
             LEFT JOIN depo_company dc ON dc.depo_id = d.id AND dc.active = 1
             LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
+            LEFT JOIN pick_up_location pul ON tp.pickup_id = pul.id AND pul.active = 1
             INNER JOIN trip_depos td ON td.trip_id = tp.trip_id 
                 AND td.depo_id = tp.depo_id 
                 AND td.product_id = tp.id

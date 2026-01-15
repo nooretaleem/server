@@ -14,9 +14,11 @@ exports.getDepos = async (req, res) => {
                 d.CB,
                 d.MD,
                 d.active,
-                dc.company_id
+                dc.company_id,
+                c.name as company_name
             FROM depo d
             LEFT JOIN depo_company dc ON d.id = dc.depo_id AND dc.active = 1
+            LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
             WHERE d.active = 1
             ORDER BY d.name
         `;
@@ -40,7 +42,8 @@ exports.getDepos = async (req, res) => {
                         CB,
                         MD,
                         active,
-                        NULL as company_id
+                        NULL as company_id,
+                        NULL as company_name
                     FROM depo
                     WHERE active = 1
                     ORDER BY name

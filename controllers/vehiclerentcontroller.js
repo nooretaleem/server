@@ -185,18 +185,21 @@ exports.addVehicleRent = async (req, res) => {
         // 3. Create transaction based on payment source
         if (payment_source === 'cash') {
             // Cash payment - credit cash in hand
-            // Get current cash in hand balance
+            // Get current cash in hand balance from last active entry
             const [balanceRows] = await connection.execute(`
-                SELECT COALESCE(SUM(debit - COALESCE(credit, 0)), 0) as balance
-                FROM cash_in_hand
+                SELECT balance 
+                FROM cash_in_hand 
+                WHERE active = 1 
+                ORDER BY created_at DESC, id DESC 
+                LIMIT 1
             `);
-            const currentBalance = parseFloat(balanceRows[0]?.balance || 0);
+            const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
             const newBalance = currentBalance - total_rent; // Credit subtracts from balance
 
             // Insert into cash_in_hand
             const [cashInHandResult] = await connection.execute(`
-                INSERT INTO cash_in_hand (credit, balance, purpose, created_at)
-                VALUES (?, ?, ?, NOW())
+                INSERT INTO cash_in_hand (credit, balance, purpose, created_at, active)
+                VALUES (?, ?, ?, NOW(), 1)
             `, [total_rent, newBalance, purpose]);
 
             const cashInHandId = cashInHandResult.insertId;
@@ -338,18 +341,21 @@ exports.updateVehicleRent = async (req, res) => {
 
             // Reverse cash in hand transaction
             if (oldTransaction.cash_in_hand_id) {
-                // Get current balance
+                // Get current balance from last active entry
                 const [balanceRows] = await connection.execute(`
-                    SELECT COALESCE(SUM(debit - COALESCE(credit, 0)), 0) as balance
-                    FROM cash_in_hand
+                    SELECT balance 
+                    FROM cash_in_hand 
+                    WHERE active = 1 
+                    ORDER BY created_at DESC, id DESC 
+                    LIMIT 1
                 `);
-                const currentBalance = parseFloat(balanceRows[0]?.balance || 0);
+                const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
                 const newBalance = currentBalance + oldAmount; // Reverse credit (add back)
 
                 // Insert reverse entry
                 await connection.execute(`
-                    INSERT INTO cash_in_hand (debit, balance, purpose, created_at)
-                    VALUES (?, ?, ?, NOW())
+                    INSERT INTO cash_in_hand (debit, balance, purpose, created_at, active)
+                    VALUES (?, ?, ?, NOW(), 1)
                 `, [oldAmount, newBalance, `Reversal: ${oldPurpose}`]);
 
                 // Mark transaction as inactive
@@ -397,17 +403,21 @@ exports.updateVehicleRent = async (req, res) => {
         // 6. Create new transaction based on payment source
         if (payment_source === 'cash') {
             // Cash payment - credit cash in hand
+            // Get current cash in hand balance from last active entry
             const [balanceRows] = await connection.execute(`
-                SELECT COALESCE(SUM(debit - COALESCE(credit, 0)), 0) as balance
-                FROM cash_in_hand
+                SELECT balance 
+                FROM cash_in_hand 
+                WHERE active = 1 
+                ORDER BY created_at DESC, id DESC 
+                LIMIT 1
             `);
-            const currentBalance = parseFloat(balanceRows[0]?.balance || 0);
+            const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
             const newBalance = currentBalance - total_rent; // Credit subtracts from balance
 
             // Insert into cash_in_hand
             const [cashInHandResult] = await connection.execute(`
-                INSERT INTO cash_in_hand (credit, balance, purpose, created_at)
-                VALUES (?, ?, ?, NOW())
+                INSERT INTO cash_in_hand (credit, balance, purpose, created_at, active)
+                VALUES (?, ?, ?, NOW(), 1)
             `, [total_rent, newBalance, newPurpose]);
 
             const cashInHandId = cashInHandResult.insertId;
@@ -523,18 +533,21 @@ exports.deleteVehicleRent = async (req, res) => {
 
             // Reverse cash in hand transaction
             if (transaction.cash_in_hand_id) {
-                // Get current balance
+                // Get current balance from last active entry
                 const [balanceRows] = await connection.execute(`
-                    SELECT COALESCE(SUM(debit - COALESCE(credit, 0)), 0) as balance
-                    FROM cash_in_hand
+                    SELECT balance 
+                    FROM cash_in_hand 
+                    WHERE active = 1 
+                    ORDER BY created_at DESC, id DESC 
+                    LIMIT 1
                 `);
-                const currentBalance = parseFloat(balanceRows[0]?.balance || 0);
+                const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
                 const newBalance = currentBalance + amount; // Reverse credit (add back)
 
                 // Insert reverse entry
                 await connection.execute(`
-                    INSERT INTO cash_in_hand (debit, balance, purpose, created_at)
-                    VALUES (?, ?, ?, NOW())
+                    INSERT INTO cash_in_hand (debit, balance, purpose, created_at, active)
+                    VALUES (?, ?, ?, NOW(), 1)
                 `, [amount, newBalance, `Reversal: ${purpose}`]);
 
                 // Mark transaction as inactive

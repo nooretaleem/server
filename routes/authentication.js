@@ -16,6 +16,7 @@ const recoveriesController = require('../controllers/recoveriescontroller');
 const expenseCategoriesController = require('../controllers/expensecategoriescontroller');
 const expensesController = require('../controllers/expensescontroller');
 const companyController = require('../controllers/companycontroller');
+const pickUpLocationController = require('../controllers/pickuplocationcontroller');
 
 // Authentication
 router.post('/login', dataController.login);
@@ -154,5 +155,12 @@ router.get('/getCompany', companyController.getCompany);
 router.post('/addCompany', companyController.addCompany);
 router.post('/updateCompany', companyController.updateCompany);
 router.delete('/deleteCompany', companyController.deleteCompany);
+
+// Pick Up Location Management
+router.get('/getPickUpLocations', pickUpLocationController.getPickUpLocations);
+router.get('/getPickUpLocation', pickUpLocationController.getPickUpLocation);
+router.post('/addPickUpLocation', pickUpLocationController.addPickUpLocation);
+router.post('/updatePickUpLocation', pickUpLocationController.updatePickUpLocation);
+router.delete('/deletePickUpLocation', pickUpLocationController.deletePickUpLocation);
 
 module.exports = router;
