@@ -159,6 +159,7 @@ exports.updateBank = async (req, res) => {
 
 // Delete bank (soft delete - set active = 0)
 exports.deleteBank = async (req, res) => {
+    const connection = await db.getConnection();
     try {
         const { id } = req.body;
 
@@ -166,17 +167,33 @@ exports.deleteBank = async (req, res) => {
             return res.status(400).json({ message: 'Bank ID is required' });
         }
 
-        // Soft delete: set active = 0 instead of deleting the record
-        const [result] = await db.execute('UPDATE bank SET active = 0, md = NOW() WHERE ID = ?', [id]);
+        await connection.beginTransaction();
 
-        if (result.affectedRows === 0) {
+        // Soft delete: set active = 0 for the bank
+        const [bankResult] = await connection.execute(
+            'UPDATE bank SET active = 0, md = NOW() WHERE ID = ?', 
+            [id]
+        );
+
+        if (bankResult.affectedRows === 0) {
+            await connection.rollback();
             return res.status(404).json({ message: 'Bank not found' });
         }
 
-        res.json({ message: 'Bank deleted successfully' });
+        // Set all associated accounts to active = 0
+        await connection.execute(
+            'UPDATE accounts SET active = 0, MD = NOW() WHERE BankID = ? AND active = 1',
+            [id]
+        );
+
+        await connection.commit();
+        res.json({ message: 'Bank and its associated accounts deleted successfully' });
     } catch (err) {
+        await connection.rollback();
         console.error('Error deleting bank:', err);
         res.status(500).json({ message: 'Server Error', error: err.message });
+    } finally {
+        connection.release();
     }
 };
 

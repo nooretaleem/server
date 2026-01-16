@@ -119,6 +119,26 @@ exports.addDepo = async (req, res) => {
             return res.status(400).json({ message: 'Phone number must be numeric and at least 11 digits' });
         }
 
+        // Check if a dealer with the same name already exists for the same company
+        if (company_id) {
+            const checkDuplicateQuery = `
+                SELECT d.id 
+                FROM depo d
+                INNER JOIN depo_company dc ON d.id = dc.depo_id AND dc.active = 1
+                WHERE LOWER(TRIM(d.name)) = LOWER(TRIM(?)) 
+                AND dc.company_id = ? 
+                AND d.active = 1
+            `;
+            const [existingDealers] = await connection.execute(checkDuplicateQuery, [name, company_id]);
+            
+            if (existingDealers.length > 0) {
+                connection.release();
+                return res.status(400).json({ 
+                    message: `A dealer with the name "${name}" already exists for this company. Please use a different name.` 
+                });
+            }
+        }
+
         // Get CB (Created By) from request body, default to 'System' if not provided
         const CB = req.body.CB || 'System';
 
@@ -220,6 +240,27 @@ exports.updateDepo = async (req, res) => {
         if (phone_no && (!/^[0-9]{11,}$/.test(phone_no))) {
             connection.release();
             return res.status(400).json({ message: 'Phone number must be numeric and at least 11 digits' });
+        }
+
+        // Check if a dealer with the same name already exists for the same company (excluding current dealer)
+        if (company_id) {
+            const checkDuplicateQuery = `
+                SELECT d.id 
+                FROM depo d
+                INNER JOIN depo_company dc ON d.id = dc.depo_id AND dc.active = 1
+                WHERE LOWER(TRIM(d.name)) = LOWER(TRIM(?)) 
+                AND dc.company_id = ? 
+                AND d.id != ?
+                AND d.active = 1
+            `;
+            const [existingDealers] = await connection.execute(checkDuplicateQuery, [name, company_id, id]);
+            
+            if (existingDealers.length > 0) {
+                connection.release();
+                return res.status(400).json({ 
+                    message: `A dealer with the name "${name}" already exists for this company. Please use a different name.` 
+                });
+            }
         }
 
         // Check if depo is used in trips by checking trip_depos table with active=1
