@@ -1,11 +1,15 @@
 {
-  "host": "localhost",
-  "user": "root",
-  "password": "",
+  "host": "pol-service-nooretaleemacademy-08de.c.aivencloud.com",
+  "user": "avnadmin",
+  "password": "AVNS_UESNDgaI3P8KYsH0Qj3",
   "database": "pol",
+  "port": 15072,
+  "ssl": true,
+  "sslCa": "certs/ca.pem",
   "connectionLimit": 10,
   "waitForConnections": true,
   "queueLimit": 0,
+  "connectTimeout": 60000,
   "privateKey":"074ef5bec2c6582fd524ebc5d6c8a88089d74c04c8b8cc69d23f52adce92adb3"
 }
 
