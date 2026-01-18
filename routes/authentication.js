@@ -17,11 +17,18 @@ const expenseCategoriesController = require('../controllers/expensecategoriescon
 const expensesController = require('../controllers/expensescontroller');
 const companyController = require('../controllers/companycontroller');
 const pickUpLocationController = require('../controllers/pickuplocationcontroller');
+const stationsController = require('../controllers/stationscontroller');
+const fuelTypesController = require('../controllers/fueltypescontroller');
+const metersController = require('../controllers/meterscontroller');
+const meterReadingsController = require('../controllers/meterreadingscontroller');
+const fuelRatesController = require('../controllers/fuelratescontroller');
+const dailySalesSummaryController = require('../controllers/dailysalessummarycontroller');
 
 // Authentication
 router.post('/login', dataController.login);
 router.post('/signup', dataController.signup);
 router.get('/getAlowedModules', dataController.getAlowedModules);
+router.get('/getCurrentUser', dataController.getCurrentUser);
 
 // Dashboard
 router.get('/getDashboardData', projectController.getDashboardData);
@@ -162,5 +169,48 @@ router.get('/getPickUpLocation', pickUpLocationController.getPickUpLocation);
 router.post('/addPickUpLocation', pickUpLocationController.addPickUpLocation);
 router.post('/updatePickUpLocation', pickUpLocationController.updatePickUpLocation);
 router.delete('/deletePickUpLocation', pickUpLocationController.deletePickUpLocation);
+
+// Stations
+router.get('/getStations', stationsController.getStations);
+router.get('/getStation', stationsController.getStation);
+router.post('/addStation', stationsController.addStation);
+router.post('/updateStation', stationsController.updateStation);
+router.delete('/deleteStation', stationsController.deleteStation);
+
+// Fuel Types
+router.get('/getFuelTypes', fuelTypesController.getFuelTypes);
+router.get('/getFuelType', fuelTypesController.getFuelType);
+router.post('/addFuelType', fuelTypesController.addFuelType);
+router.post('/updateFuelType', fuelTypesController.updateFuelType);
+router.delete('/deleteFuelType', fuelTypesController.deleteFuelType);
+
+// Meters
+router.get('/getMeters', metersController.getMeters);
+router.get('/getMeter', metersController.getMeter);
+router.post('/addMeter', metersController.addMeter);
+router.post('/updateMeter', metersController.updateMeter);
+router.delete('/deleteMeter', metersController.deleteMeter);
+
+// Meter Readings
+router.get('/getMeterReadings', meterReadingsController.getMeterReadings);
+router.get('/getMeterReading', meterReadingsController.getMeterReading);
+router.post('/addMeterReading', meterReadingsController.addMeterReading);
+router.post('/updateMeterReading', meterReadingsController.updateMeterReading);
+router.delete('/deleteMeterReading', meterReadingsController.deleteMeterReading);
+
+// Fuel Rates
+router.get('/getFuelRates', fuelRatesController.getFuelRates);
+router.get('/getFuelRate', fuelRatesController.getFuelRate);
+router.get('/getCurrentFuelRate', fuelRatesController.getCurrentFuelRate);
+router.post('/addFuelRate', fuelRatesController.addFuelRate);
+router.post('/updateFuelRate', fuelRatesController.updateFuelRate);
+router.delete('/deleteFuelRate', fuelRatesController.deleteFuelRate);
+
+// Daily Sales Summary
+router.get('/getDailySalesSummaries', dailySalesSummaryController.getDailySalesSummaries);
+router.get('/getDailySalesSummary', dailySalesSummaryController.getDailySalesSummary);
+router.post('/addDailySalesSummary', dailySalesSummaryController.addDailySalesSummary);
+router.post('/updateDailySalesSummary', dailySalesSummaryController.updateDailySalesSummary);
+router.delete('/deleteDailySalesSummary', dailySalesSummaryController.deleteDailySalesSummary);
 
 module.exports = router;

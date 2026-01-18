@@ -72,14 +72,58 @@ exports.getPoolHistory = async (req, res) => {
                 p.Credit,
                 p.DepoLimit,
                 p.active,
-                d.name as DepoName
+                p.TripID,
+                p.payment_id,
+                p.recovery_id,
+                d.name as DepoName,
+                t.trip_no,
+                pay.id as payment_display_id,
+                r.id as recovery_display_id,
+                c.name as customer_name
             FROM pool p
             INNER JOIN depo d ON p.DepoID = d.id
+            LEFT JOIN trips t ON p.TripID = t.id
+            LEFT JOIN payments pay ON p.payment_id = pay.id
+            LEFT JOIN recoveries r ON p.recovery_id = r.id
+            LEFT JOIN customers c ON r.ClientID = c.id AND c.active = 1
             WHERE p.DepoID = ? AND p.active = 1
             ORDER BY p.ID ASC
         `;
         const [rows] = await db.execute(query, [depoId]);
-        res.json(rows);
+        
+        // Build reason for each row
+        // Priority: recovery_id > payment_id > TripID > initial balance
+        const rowsWithReason = rows.map(row => {
+            let reason = '';
+            
+            // Priority 1: Recovery (direct payment from customer)
+            if (row.recovery_id && row.recovery_display_id) {
+                if (row.customer_name) {
+                    reason = `Direct payment from customer "${row.customer_name}" (Recovery ID: ${row.recovery_display_id})`;
+                } else {
+                    reason = `Direct payment from customer (Recovery ID: ${row.recovery_display_id})`;
+                }
+            }
+            // Priority 2: Payment made to dealer
+            else if (row.payment_id && row.payment_display_id) {
+                reason = `Payment made to dealer (Payment ID: ${row.payment_display_id})`;
+            }
+            // Priority 3: Fuel purchased on credit for trip
+            else if (row.TripID && row.trip_no) {
+                reason = `Fuel purchased on credit for Trip ${row.trip_no}`;
+            }
+            // Default: Initial balance or other
+            else {
+                reason = 'Initial balance';
+            }
+            
+            return {
+                ...row,
+                Reason: reason
+            };
+        });
+        
+        res.json(rowsWithReason);
     } catch (err) {
         console.error('Error fetching pool history:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {

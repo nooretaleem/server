@@ -20,7 +20,7 @@ exports.login = async (req, res) => {
             return res.status(400).json({ message: 'Email and password are required' });
         }
         
-        const [rows] = await db.execute('Select users.id,users.password, users.email,roles.roletype from users Inner Join '
+        const [rows] = await db.execute('Select users.id,users.password, users.email, users.name, roles.roletype from users Inner Join '
         +' roles on users.roleid=roles.id where email = ?', [
             email,
         ]);
@@ -33,6 +33,7 @@ exports.login = async (req, res) => {
             const hashedPassword = rows[0].password;
             const userrole = rows[0].roletype;
             const userid = rows[0].id;
+            const username = rows[0].name || rows[0].email; // Use name if available, else use email
             
             // Compare password with hashed password
             bcrypt.compare(password, hashedPassword, function (err, result) {
@@ -47,7 +48,8 @@ exports.login = async (req, res) => {
                         accessToken: token, 
                         role: userrole, 
                         expiry: new Date().getTime() + 15 * 60 * 1000,
-                        userid: userid
+                        userid: userid,
+                        name: username
                     });
                 } else {
                     console.log("---------> Password Incorrect");
@@ -120,6 +122,27 @@ function hashPassword(password) {
         });
     });
 }
+
+exports.getCurrentUser = async (req, res) => {
+    try {
+        const userid = req.query.userid;
+        
+        if (!userid) {
+            return res.status(400).json({ message: 'User ID is required' });
+        }
+        
+        const [rows] = await db.execute('SELECT id, name, email FROM users WHERE id = ?', [userid]);
+        
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        
+        res.json(rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Server Error' });
+    }
+};
 
 exports.getAlowedModules=async(req,res)=>{
     const username=req.query.username;
