@@ -1,4 +1,6 @@
 const db = require('../models/db');
+const jwt = require('jsonwebtoken');
+const config = require('../config/config.json');
 
 // Get all expenses
 exports.getExpenses = async (req, res) => {
@@ -340,6 +342,31 @@ exports.addExpense = async (req, res) => {
                 );
             }
 
+            // Get CB (Created By) from logged-in user
+            let CB = 'System';
+            try {
+                // Get token from headers
+                const token = req.headers.authorization?.replace('Bearer ', '') || req.headers.token;
+                if (token) {
+                    // Decode token to get userid
+                    const decoded = jwt.verify(token, config.privateKey);
+                    const userid = decoded.userid;
+                    
+                    // Query database to get username
+                    const [userRows] = await connection.execute(
+                        'SELECT name, email FROM users WHERE id = ?',
+                        [userid]
+                    );
+                    
+                    if (userRows.length > 0) {
+                        CB = userRows[0].name || userRows[0].email || 'System';
+                    }
+                }
+            } catch (err) {
+                // If token is invalid or user not found, default to 'System'
+                console.log('Error getting username from token:', err.message);
+            }
+
             // Insert into expenses table
             const expenseQuery = `
                 INSERT INTO expenses (
@@ -348,9 +375,10 @@ exports.addExpense = async (req, res) => {
                     amount,
                     expense_date,
                     description,
+                    CB,
                     CD,
                     active
-                ) VALUES (?, ?, ?, ?, ?, NOW(),1)
+                ) VALUES (?, ?, ?, ?, ?, ?, NOW(), 1)
             `;
             
             const [expenseResult] = await connection.execute(expenseQuery, [
@@ -358,7 +386,8 @@ exports.addExpense = async (req, res) => {
                 transactionID,
                 amount,
                 expense_date,
-                description || null
+                description || null,
+                CB
             ]);
 
             await connection.commit();
