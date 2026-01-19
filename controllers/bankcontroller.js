@@ -5,15 +5,18 @@ exports.getBanks = async (req, res) => {
     try {
         const query = `
             SELECT 
-                ID,
-                Name,
-                Branch,
-                cd,
-                md,
-                active
-            FROM bank
-            WHERE active = 1
-            ORDER BY ID DESC
+                b.ID,
+                b.Name,
+                b.Branch,
+                b.cd,
+                b.md,
+                b.active,
+                COALESCE(SUM(a.Balance), 0) as totalBalance
+            FROM bank b
+            LEFT JOIN accounts a ON b.ID = a.BankID AND a.active = 1
+            WHERE b.active = 1
+            GROUP BY b.ID, b.Name, b.Branch, b.cd, b.md, b.active
+            ORDER BY b.ID DESC
         `;
         const [rows] = await db.execute(query);
         res.json(rows);

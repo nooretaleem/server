@@ -13,7 +13,7 @@ exports.getExpenses = async (req, res) => {
                 e.amount,
                 e.expense_date,
                 e.description,
-                e.created_at,
+                e.CD,
                 ec.name as category_name,
                 ec.expense_type,
                 t.Purpose as transaction_purpose,
@@ -24,15 +24,16 @@ exports.getExpenses = async (req, res) => {
             FROM expenses e
             LEFT JOIN expense_categories ec ON e.category_id = ec.id
             LEFT JOIN transactions t ON e.transaction_id = t.ID
+           
         `;
         
         const params = [];
         if (expense_type && (expense_type === 'BUSINESS' || expense_type === 'PERSONAL')) {
-            query += ' WHERE ec.expense_type = ?';
+            query += ' WHERE  e.active=1 and t.active=1 and ec.expense_type = ?';
             params.push(expense_type);
         }
         
-        query += ' ORDER BY e.expense_date DESC, e.created_at DESC';
+        query += ' ORDER BY e.expense_date , e.CD DESC';
         
         const [rows] = await db.execute(query, params);
         res.json(rows);
@@ -62,7 +63,7 @@ exports.getExpense = async (req, res) => {
                 e.amount,
                 e.expense_date,
                 e.description,
-                e.created_at,
+                e.CD,
                 ec.name as category_name,
                 ec.expense_type,
                 t.Purpose as transaction_purpose,
@@ -73,7 +74,7 @@ exports.getExpense = async (req, res) => {
             FROM expenses e
             LEFT JOIN expense_categories ec ON e.category_id = ec.id
             LEFT JOIN transactions t ON e.transaction_id = t.ID
-            WHERE e.id = ?
+            WHERE e.active=1 and t.active=1e.id = ?
         `;
         const [rows] = await db.execute(query, [id]);
         
@@ -100,12 +101,12 @@ exports.getTotalExpenses = async (req, res) => {
             SELECT 
                 COALESCE(SUM(e.amount), 0) as total
             FROM expenses e
-            LEFT JOIN expense_categories ec ON e.category_id = ec.id
+            LEFT JOIN expense_categories ec ON e.category_id = ec.id 
         `;
         
         const params = [];
         if (expense_type && (expense_type === 'BUSINESS' || expense_type === 'PERSONAL')) {
-            query += ' WHERE ec.expense_type = ?';
+            query += ' WHERE e.active=1 and ec.expense_type = ?';
             params.push(expense_type);
         }
         
@@ -347,8 +348,9 @@ exports.addExpense = async (req, res) => {
                     amount,
                     expense_date,
                     description,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, NOW())
+                    CD,
+                    active
+                ) VALUES (?, ?, ?, ?, ?, NOW(),1)
             `;
             
             const [expenseResult] = await connection.execute(expenseQuery, [
@@ -699,7 +701,8 @@ exports.updateExpense = async (req, res) => {
 // Delete expense
 exports.deleteExpense = async (req, res) => {
     try {
-        const id = req.query.id;
+        // Check both query params and body for ID (frontend sends in body for DELETE)
+        const id = req.query.id || req.body?.id;
 
         if (!id) {
             return res.status(400).json({ message: 'Expense ID is required' });
@@ -750,20 +753,57 @@ exports.deleteExpense = async (req, res) => {
                         );
                     }
                 } else if (transaction.cash_in_hand_id) {
-                    // For cash in hand, we would need to reverse the cash_in_hand entry
-                    // This is complex, so we'll just delete the transaction
+                    // Get cash_in_hand record details
+                    const [cashInHandRows] = await connection.execute(
+                        'SELECT id, debit, credit, balance, created_at FROM cash_in_hand WHERE id = ? AND Active = 1',
+                        [transaction.cash_in_hand_id]
+                    );
+
+                    if (cashInHandRows.length > 0) {
+                        const cashInHandRecord = cashInHandRows[0];
+                        const deletedAmount = parseFloat(cashInHandRecord.debit || cashInHandRecord.credit || 0);
+                        const deletedRecordId = cashInHandRecord.id;
+                        const deletedCreatedAt = cashInHandRecord.created_at;
+
+                        // Set Active=0 for the cash_in_hand record
+                        await connection.execute(
+                            'UPDATE cash_in_hand SET Active = 0 WHERE id = ?',
+                            [deletedRecordId]
+                        );
+
+                        // Recalculate balances for all subsequent records
+                        // Get all records that were created after this one (or have higher id)
+                        const [subsequentRows] = await connection.execute(
+                            `SELECT id, debit, credit, balance FROM cash_in_hand 
+                             WHERE Active = 1 
+                             AND (created_at > ? OR (created_at = ? AND id > ?))
+                             ORDER BY created_at ASC, id ASC`,
+                            [deletedCreatedAt, deletedCreatedAt, deletedRecordId]
+                        );
+
+                        // Recalculate balances: add back the deleted amount to all subsequent records
+                        for (const record of subsequentRows) {
+                            const currentBalance = parseFloat(record.balance || 0);
+                            const newBalance = currentBalance + deletedAmount; // Add back the deleted amount
+                            
+                            await connection.execute(
+                                'UPDATE cash_in_hand SET balance = ? WHERE id = ?',
+                                [newBalance, record.id]
+                            );
+                        }
+                    }
                 }
 
                 // Delete transaction
                 await connection.execute(
-                    'DELETE FROM transactions WHERE ID = ?',
-                    [transactionID]
+                     'UPDATE transactions SET Active = 0 WHERE ID = ?',
+                     [transactionID]
                 );
             }
 
             // Delete expense
             await connection.execute(
-                'DELETE FROM expenses WHERE id = ?',
+                'UPDATE expenses SET Active = 0 WHERE ID = ?',
                 [id]
             );
 

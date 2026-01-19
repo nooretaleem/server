@@ -113,6 +113,7 @@ router.get('/getAccount', accountController.getAccount);
 router.post('/addAccount', accountController.addAccount);
 router.post('/updateAccount', accountController.updateAccount);
 router.delete('/deleteAccount', accountController.deleteAccount);
+router.post('/accounts/:id/qr', accountController.uploadQrCodeMiddleware, accountController.uploadQrCode);
 
 // Transaction Management
 router.post('/addPayment', transactionController.addPayment);

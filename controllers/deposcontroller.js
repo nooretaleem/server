@@ -1,4 +1,6 @@
 const db = require('../models/db');
+const jwt = require('jsonwebtoken');
+const config = require('../config/config.json');
 
 // Get all depos (only active ones)
 exports.getDepos = async (req, res) => {
@@ -7,6 +9,7 @@ exports.getDepos = async (req, res) => {
             SELECT 
                 d.id,
                 d.name,
+                d.code,
                 d.phone_no,
                 d.address,
                 d.Balance,
@@ -35,6 +38,7 @@ exports.getDepos = async (req, res) => {
                     SELECT 
                         id,
                         name,
+                        code,
                         phone_no,
                         address,
                         Balance,
@@ -102,6 +106,7 @@ exports.addDepo = async (req, res) => {
     try {
         const {
             name,
+            code,
             phone_no,
             address,
             Balance,
@@ -117,6 +122,11 @@ exports.addDepo = async (req, res) => {
         if (phone_no && (!/^[0-9]{11,}$/.test(phone_no))) {
             connection.release();
             return res.status(400).json({ message: 'Phone number must be numeric and at least 11 digits' });
+        }
+         // Validate code if provided (should be alpha numeric and minimum 4 characters)
+         if (code && (!/^[a-zA-Z0-9]{4,}$/.test(code))) {
+            connection.release();
+            return res.status(400).json({ message: 'Depo Code must be alphanumeric and at least 4 characters' });
         }
 
         // Check if a dealer with the same name already exists for the same company
@@ -139,8 +149,30 @@ exports.addDepo = async (req, res) => {
             }
         }
 
-        // Get CB (Created By) from request body, default to 'System' if not provided
-        const CB = req.body.CB || 'System';
+        // Get CB (Created By) from logged-in user
+        let CB = 'System';
+        try {
+            // Get token from headers
+            const token = req.headers.authorization?.replace('Bearer ', '') || req.headers.token;
+            if (token) {
+                // Decode token to get userid
+                const decoded = jwt.verify(token, config.privateKey);
+                const userid = decoded.userid;
+                
+                // Query database to get username
+                const [userRows] = await connection.execute(
+                    'SELECT name, email FROM users WHERE id = ?',
+                    [userid]
+                );
+                
+                if (userRows.length > 0) {
+                    CB = userRows[0].name || userRows[0].email || 'System';
+                }
+            }
+        } catch (err) {
+            // If token is invalid or user not found, default to 'System'
+            console.log('Error getting username from token:', err.message);
+        }
 
         const balanceAmount = parseFloat(Balance) || 0;
 
@@ -148,12 +180,13 @@ exports.addDepo = async (req, res) => {
 
         // Insert into depo table with CB, CD, MD, active
         const depoQuery = `
-            INSERT INTO depo (name, phone_no, address, Balance, CB, CD, MD, active) 
-            VALUES (?, ?, ?, ?, ?, NOW(), NOW(), 1)
+            INSERT INTO depo (name, code,phone_no, address, Balance, CB, CD, MD, active) 
+            VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)
         `;
 
         const [depoResult] = await connection.execute(depoQuery, [
             name,
+            code || null,
             phone_no || null,
             address || null,
             balanceAmount,
@@ -220,6 +253,7 @@ exports.updateDepo = async (req, res) => {
         const {
             id,
             name,
+            code,
             phone_no,
             address,
             Balance,
@@ -234,6 +268,12 @@ exports.updateDepo = async (req, res) => {
         if (!name) {
             connection.release();
             return res.status(400).json({ message: 'Depo name is required' });
+        }
+
+        // Validate code if provided (should be alphanumeric and minimum 4 characters)
+        if (code !== undefined && code !== null && code !== '' && (!/^[a-zA-Z0-9]{4,}$/.test(code))) {
+            connection.release();
+            return res.status(400).json({ message: 'Depo Code must be alphanumeric and at least 4 characters' });
         }
 
         // Validate phone number if provided (should be numeric and minimum 11 digits)
@@ -370,8 +410,8 @@ exports.updateDepo = async (req, res) => {
         }
 
         // Step 4: Update depo table (only update balance if depo is not used in trips)
-        const updateFields = ['name = ?', 'phone_no = ?', 'address = ?', 'MD = NOW()'];
-        const updateValues = [name, phone_no || null, address || null];
+        const updateFields = ['name = ?', 'code = ?', 'phone_no = ?', 'address = ?', 'MD = NOW()'];
+        const updateValues = [name, code || null, phone_no || null, address || null];
         
         if (!isDepoUsedInTrips) {
             updateFields.push('Balance = ?');
