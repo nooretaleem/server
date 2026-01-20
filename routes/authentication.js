@@ -134,6 +134,7 @@ router.get('/getCashInHandHistoryByDate', cashInHandController.getCashInHandHist
 router.get('/checkCashInHandReferences', cashInHandController.checkCashInHandReferences);
 router.post('/addCashInHand', cashInHandController.addCashInHand);
 router.post('/updateCashInHand', cashInHandController.updateCashInHand);
+router.post('/transferToBank', cashInHandController.transferToBank);
 router.delete('/deleteCashInHand', cashInHandController.deleteCashInHand);
 
 // Recoveries Management

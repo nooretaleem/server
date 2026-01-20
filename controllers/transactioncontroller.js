@@ -471,12 +471,18 @@ exports.getPayments = async (req, res) => {
 exports.addAccountTransaction = async (req, res) => {
     try {
         const {
-            AccountID,
+            AccountID, // Current account (destination for deposit, source for withdrawal)
             TransactionType, // 'deposit' or 'withdrawal'
             Amount,
             Purpose,
             PaymentMode,
-            ReferenceNo
+            ReferenceNo,
+            Source, // 'bank', 'cash_in_hand', or 'current_bank_account'
+            Destination, // 'bank', 'cash_in_hand', or 'current_bank_account'
+            SourceBankID,
+            SourceAccountID,
+            DestinationBankID,
+            DestinationAccountID
         } = req.body;
 
         // Validation
@@ -500,9 +506,9 @@ exports.addAccountTransaction = async (req, res) => {
             // Start transaction
             await connection.beginTransaction();
 
-            // Get current account balance
+            // Get current account (destination for deposit, source for withdrawal)
             const [accountRows] = await connection.execute(
-                'SELECT Balance FROM accounts WHERE ID = ? AND active = 1',
+                'SELECT Balance, AccountTitle, AccountNo FROM accounts WHERE ID = ? AND active = 1',
                 [AccountID]
             );
 
@@ -512,60 +518,340 @@ exports.addAccountTransaction = async (req, res) => {
                 return res.status(404).json({ message: 'Account not found or inactive' });
             }
 
-            const currentBalance = parseFloat(accountRows[0].Balance) || 0;
-            let newBalance;
-            let debit = 0;
-            let credit = 0;
+            const currentAccountBalance = parseFloat(accountRows[0].Balance) || 0;
+            const currentAccountTitle = accountRows[0].AccountTitle || '';
+            const currentAccountNo = accountRows[0].AccountNo || '';
+            let cashInHandId = null;
+            let sourceTransactionID = null;
+            let destinationTransactionID = null;
 
             if (TransactionType === 'deposit') {
-                // Deposit increases balance - money received (Credit)
-                debit = 0;
-                credit = Amount;
-                newBalance = currentBalance + Amount;
+                // DEPOSIT: Money coming INTO current account
+                // Current account is credited (balance increases)
+                
+                // Check if source account has sufficient balance
+                if (Source === 'cash_in_hand') {
+                    // Source: Cash in Hand -> Destination: Current Bank Account
+                    // 1. Debit cash_in_hand (money going out)
+                    const [cashBalanceRows] = await connection.execute(`
+                        SELECT COALESCE(SUM(COALESCE(credit, 0) - COALESCE(debit, 0)), 0) as balance
+                        FROM cash_in_hand
+                        WHERE Active = 1
+                    `);
+                    const currentCashBalance = parseFloat(cashBalanceRows[0]?.balance || 0);
+                    
+                    if (currentCashBalance < Amount) {
+                        await connection.rollback();
+                        connection.release();
+                        return res.status(400).json({ 
+                            message: `Insufficient cash in hand balance. Available balance: ${currentCashBalance.toFixed(2)}, Required: ${Amount.toFixed(2)}` 
+                        });
+                    }
+
+                    const newCashBalance = currentCashBalance - Amount;
+                    const cashPurpose = `Deposit to ${currentAccountTitle} (${currentAccountNo}) - ${Purpose}`;
+                    const cashInHandQuery = `
+                        INSERT INTO cash_in_hand (
+                            debit,
+                            credit,
+                            balance,
+                            purpose,
+                            created_at,
+                            Active
+                        ) VALUES (?, 0, ?, ?, NOW(), 1)
+                    `;
+                    
+                    const [cashInHandResult] = await connection.execute(cashInHandQuery, [
+                        Amount,
+                        newCashBalance,
+                        cashPurpose
+                    ]);
+                    cashInHandId = cashInHandResult.insertId;
+
+                    // 2. Credit current account (create transaction record)
+                    const newAccountBalance = currentAccountBalance + Amount;
+                    const transactionQuery = `
+                        INSERT INTO transactions (
+                            AccountID, 
+                            cash_in_hand_id,
+                            Purpose, 
+                            Debit, 
+                            Credit, 
+                            Date, 
+                            PaymentMode, 
+                            ReferenceNo, 
+                            active
+                        ) VALUES (?, ?, ?, 0, ?, NOW(), ?, ?, 1)
+                    `;
+                    
+                    const transactionPurpose = `Deposit from Cash in Hand - ${Purpose}`;
+                    const [transactionResult] = await connection.execute(transactionQuery, [
+                        AccountID,
+                        cashInHandId,
+                        transactionPurpose,
+                        Amount,
+                        PaymentMode || null,
+                        ReferenceNo || null
+                    ]);
+                    destinationTransactionID = transactionResult.insertId;
+
+                    // 3. Update current account balance
+                    await connection.execute(
+                        'UPDATE accounts SET Balance = ?, MD = NOW() WHERE ID = ?',
+                        [newAccountBalance, AccountID]
+                    );
+
+                } else if (Source === 'bank' && SourceAccountID) {
+                    // Source: Another Bank Account -> Destination: Current Bank Account
+                    // 1. Get source account details
+                    const [sourceAccountRows] = await connection.execute(
+                        'SELECT Balance, AccountTitle, AccountNo FROM accounts WHERE ID = ? AND active = 1',
+                        [SourceAccountID]
+                    );
+
+                    if (sourceAccountRows.length === 0) {
+                        await connection.rollback();
+                        connection.release();
+                        return res.status(404).json({ message: 'Source account not found or inactive' });
+                    }
+
+                    const sourceAccountBalance = parseFloat(sourceAccountRows[0].Balance) || 0;
+                    const sourceAccountTitle = sourceAccountRows[0].AccountTitle || '';
+                    const sourceAccountNo = sourceAccountRows[0].AccountNo || '';
+
+                    if (sourceAccountBalance < Amount) {
+                        await connection.rollback();
+                        connection.release();
+                        return res.status(400).json({ 
+                            message: `Insufficient balance in source account. Available balance: ${sourceAccountBalance.toFixed(2)}, Required: ${Amount.toFixed(2)}` 
+                        });
+                    }
+
+                    // 2. Debit source account (create transaction record)
+                    const newSourceBalance = sourceAccountBalance - Amount;
+                    const sourceTransactionQuery = `
+                        INSERT INTO transactions (
+                            AccountID, 
+                            Purpose, 
+                            Debit, 
+                            Credit, 
+                            Date, 
+                            PaymentMode, 
+                            ReferenceNo, 
+                            active
+                        ) VALUES (?, ?, ?, 0, NOW(), ?, ?, 1)
+                    `;
+                    
+                    const sourcePurpose = `Transfer to ${currentAccountTitle} (${currentAccountNo}) - ${Purpose}`;
+                    const [sourceTransactionResult] = await connection.execute(sourceTransactionQuery, [
+                        SourceAccountID,
+                        sourcePurpose,
+                        Amount,
+                        PaymentMode || null,
+                        ReferenceNo || null
+                    ]);
+                    sourceTransactionID = sourceTransactionResult.insertId;
+
+                    // 3. Update source account balance
+                    await connection.execute(
+                        'UPDATE accounts SET Balance = ?, MD = NOW() WHERE ID = ?',
+                        [newSourceBalance, SourceAccountID]
+                    );
+
+                    // 4. Credit current account (create transaction record)
+                    const newAccountBalance = currentAccountBalance + Amount;
+                    const destinationTransactionQuery = `
+                        INSERT INTO transactions (
+                            AccountID, 
+                            Purpose, 
+                            Debit, 
+                            Credit, 
+                            Date, 
+                            PaymentMode, 
+                            ReferenceNo, 
+                            active
+                        ) VALUES (?, ?, 0, ?, NOW(), ?, ?, 1)
+                    `;
+                    
+                    const destinationPurpose = `Transfer from ${sourceAccountTitle} (${sourceAccountNo}) - ${Purpose}`;
+                    const [destinationTransactionResult] = await connection.execute(destinationTransactionQuery, [
+                        AccountID,
+                        destinationPurpose,
+                        Amount,
+                        PaymentMode || null,
+                        ReferenceNo || null
+                    ]);
+                    destinationTransactionID = destinationTransactionResult.insertId;
+
+                    // 5. Update current account balance
+                    await connection.execute(
+                        'UPDATE accounts SET Balance = ?, MD = NOW() WHERE ID = ?',
+                        [newAccountBalance, AccountID]
+                    );
+                }
+
             } else {
-                // Withdrawal decreases balance - money paid out (Debit)
-                if (currentBalance < Amount) {
+                // WITHDRAWAL: Money going OUT OF current account
+                // Current account is debited (balance decreases)
+                
+                if (currentAccountBalance < Amount) {
                     await connection.rollback();
                     connection.release();
                     return res.status(400).json({ 
-                        message: `Insufficient balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${Amount.toFixed(2)}` 
+                        message: `Insufficient balance. Available balance: ${currentAccountBalance.toFixed(2)}, Required: ${Amount.toFixed(2)}` 
                     });
                 }
-                debit = Amount;
-                credit = 0;
-                newBalance = currentBalance - Amount;
+
+                if (Destination === 'cash_in_hand') {
+                    // Source: Current Bank Account -> Destination: Cash in Hand
+                    // 1. Debit current account (create transaction record)
+                    const newAccountBalance = currentAccountBalance - Amount;
+                    const transactionQuery = `
+                        INSERT INTO transactions (
+                            AccountID, 
+                            cash_in_hand_id,
+                            Purpose, 
+                            Debit, 
+                            Credit, 
+                            Date, 
+                            PaymentMode, 
+                            ReferenceNo, 
+                            active
+                        ) VALUES (?, ?, ?, ?, 0, NOW(), ?, ?, 1)
+                    `;
+                    
+                    const transactionPurpose = `Withdrawal to Cash in Hand - ${Purpose}`;
+                    const [transactionResult] = await connection.execute(transactionQuery, [
+                        AccountID,
+                        null, // Will be set after cash_in_hand entry is created
+                        transactionPurpose,
+                        Amount, // Debit amount
+                        PaymentMode || null,
+                        ReferenceNo || null
+                    ]);
+                    sourceTransactionID = transactionResult.insertId;
+
+                    // 2. Update current account balance
+                    await connection.execute(
+                        'UPDATE accounts SET Balance = ?, MD = NOW() WHERE ID = ?',
+                        [newAccountBalance, AccountID]
+                    );
+
+                    // 3. Credit cash_in_hand (money coming in)
+                    const [cashBalanceRows] = await connection.execute(`
+                        SELECT COALESCE(SUM(COALESCE(credit, 0) - COALESCE(debit, 0)), 0) as balance
+                        FROM cash_in_hand
+                        WHERE Active = 1
+                    `);
+                    const currentCashBalance = parseFloat(cashBalanceRows[0]?.balance || 0);
+                    const newCashBalance = currentCashBalance + Amount;
+
+                    const cashPurpose = `Withdrawal from ${currentAccountTitle} (${currentAccountNo}) - ${Purpose}`;
+                    const cashInHandQuery = `
+                        INSERT INTO cash_in_hand (
+                            debit,
+                            credit,
+                            balance,
+                            purpose,
+                            created_at,
+                            Active
+                        ) VALUES (0, ?, ?, ?, NOW(), 1)
+                    `;
+                    
+                    const [cashInHandResult] = await connection.execute(cashInHandQuery, [
+                        Amount,
+                        newCashBalance,
+                        cashPurpose
+                    ]);
+                    cashInHandId = cashInHandResult.insertId;
+
+                    // 4. Update transaction with cash_in_hand_id
+                    await connection.execute(
+                        'UPDATE transactions SET cash_in_hand_id = ? WHERE ID = ?',
+                        [cashInHandId, sourceTransactionID]
+                    );
+
+                } else if (Destination === 'bank' && DestinationAccountID) {
+                    // Source: Current Bank Account -> Destination: Another Bank Account
+                    // 1. Get destination account details
+                    const [destAccountRows] = await connection.execute(
+                        'SELECT Balance, AccountTitle, AccountNo FROM accounts WHERE ID = ? AND active = 1',
+                        [DestinationAccountID]
+                    );
+
+                    if (destAccountRows.length === 0) {
+                        await connection.rollback();
+                        connection.release();
+                        return res.status(404).json({ message: 'Destination account not found or inactive' });
+                    }
+
+                    const destAccountBalance = parseFloat(destAccountRows[0].Balance) || 0;
+                    const destAccountTitle = destAccountRows[0].AccountTitle || '';
+                    const destAccountNo = destAccountRows[0].AccountNo || '';
+
+                    // 2. Debit current account (create transaction record)
+                    const newAccountBalance = currentAccountBalance - Amount;
+                    const sourceTransactionQuery = `
+                        INSERT INTO transactions (
+                            AccountID, 
+                            Purpose, 
+                            Debit, 
+                            Credit, 
+                            Date, 
+                            PaymentMode, 
+                            ReferenceNo, 
+                            active
+                        ) VALUES (?, ?, ?, 0, NOW(), ?, ?, 1)
+                    `;
+                    
+                    const sourcePurpose = `Transfer to ${destAccountTitle} (${destAccountNo}) - ${Purpose}`;
+                    const [sourceTransactionResult] = await connection.execute(sourceTransactionQuery, [
+                        AccountID,
+                        sourcePurpose,
+                        Amount,
+                        PaymentMode || null,
+                        ReferenceNo || null
+                    ]);
+                    sourceTransactionID = sourceTransactionResult.insertId;
+
+                    // 3. Update current account balance
+                    await connection.execute(
+                        'UPDATE accounts SET Balance = ?, MD = NOW() WHERE ID = ?',
+                        [newAccountBalance, AccountID]
+                    );
+
+                    // 4. Credit destination account (create transaction record)
+                    const newDestBalance = destAccountBalance + Amount;
+                    const destinationTransactionQuery = `
+                        INSERT INTO transactions (
+                            AccountID, 
+                            Purpose, 
+                            Debit, 
+                            Credit, 
+                            Date, 
+                            PaymentMode, 
+                            ReferenceNo, 
+                            active
+                        ) VALUES (?, ?, 0, ?, NOW(), ?, ?, 1)
+                    `;
+                    
+                    const destinationPurpose = `Transfer from ${currentAccountTitle} (${currentAccountNo}) - ${Purpose}`;
+                    const [destinationTransactionResult] = await connection.execute(destinationTransactionQuery, [
+                        DestinationAccountID,
+                        destinationPurpose,
+                        Amount,
+                        PaymentMode || null,
+                        ReferenceNo || null
+                    ]);
+                    destinationTransactionID = destinationTransactionResult.insertId;
+
+                    // 5. Update destination account balance
+                    await connection.execute(
+                        'UPDATE accounts SET Balance = ?, MD = NOW() WHERE ID = ?',
+                        [newDestBalance, DestinationAccountID]
+                    );
+                }
             }
-
-            // Insert into transactions table
-            const transactionQuery = `
-                INSERT INTO transactions (
-                    AccountID, 
-                    Purpose, 
-                    Debit, 
-                    Credit, 
-                    Date, 
-                    PaymentMode, 
-                    ReferenceNo, 
-                    active
-                ) VALUES (?, ?, ?, ?, NOW(), ?, ?, 1)
-            `;
-            
-            const [transactionResult] = await connection.execute(transactionQuery, [
-                AccountID,
-                Purpose,
-                debit,
-                credit,
-                PaymentMode || null,
-                ReferenceNo || null
-            ]);
-            
-            const transactionID = transactionResult.insertId;
-
-            // Update account balance
-            await connection.execute(
-                'UPDATE accounts SET Balance = ? WHERE ID = ?',
-                [newBalance, AccountID]
-            );
 
             // Commit transaction
             await connection.commit();
@@ -573,8 +859,9 @@ exports.addAccountTransaction = async (req, res) => {
 
             res.json({
                 message: `${TransactionType === 'deposit' ? 'Deposit' : 'Withdrawal'} transaction added successfully`,
-                transactionID: transactionID,
-                newBalance: newBalance
+                sourceTransactionID: sourceTransactionID,
+                destinationTransactionID: destinationTransactionID,
+                cashInHandId: cashInHandId
             });
 
         } catch (err) {

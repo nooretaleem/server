@@ -190,6 +190,8 @@ exports.getCashInHandHistoryByDate = async (req, res) => {
         // Use DATE_FORMAT to match dates properly and avoid timezone issues
         // Simply select all columns including balance from the table
         // Only show active records (Active = 1)
+        // Order by balance DESC (highest first) since higher balance = earlier transaction
+        // Then by created_at ASC and id ASC as tiebreakers
         const query = `
             SELECT 
                 id,
@@ -201,7 +203,7 @@ exports.getCashInHandHistoryByDate = async (req, res) => {
                     FROM cash_in_hand
             WHERE DATE_FORMAT(created_at, '%Y-%m-%d') = ?
             AND Active = 1
-            ORDER BY created_at ASC, id ASC
+            ORDER BY balance DESC, created_at ASC, id ASC
         `;
         
         const [rows] = await db.execute(query, [formattedDate]);
@@ -541,6 +543,162 @@ exports.deleteCashInHand = async (req, res) => {
     } catch (err) {
         console.error('Error deleting cash in hand:', err);
         res.status(500).json({ message: 'Server Error', error: err.message });
+    }
+};
+
+// Transfer funds from cash in hand to bank account
+exports.transferToBank = async (req, res) => {
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const { accountId, amount, purpose, date, paymentMode, referenceNo } = req.body;
+
+        // Validation
+        if (!accountId) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ message: 'Bank account ID is required' });
+        }
+
+        if (!amount || amount <= 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ message: 'Amount must be greater than 0' });
+        }
+
+        // Check if account exists and is active (also get bank and account details)
+        const [accountRows] = await connection.execute(
+            `SELECT 
+                ID,
+                BankID,
+                AccountTitle,
+                AccountNo,
+                Balance
+             FROM accounts 
+             WHERE ID = ? AND active = 1`,
+            [accountId]
+        );
+
+        if (accountRows.length === 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(404).json({ message: 'Bank account not found or inactive' });
+        }
+
+        const accountInfo = accountRows[0];
+        const currentAccountBalance = parseFloat(accountInfo.Balance) || 0;
+
+        // Check cash in hand balance
+        const [cashBalanceRows] = await connection.execute(`
+            SELECT COALESCE(SUM(COALESCE(credit, 0) - COALESCE(debit, 0)), 0) as balance
+            FROM cash_in_hand
+            WHERE Active = 1
+        `);
+        const currentCashBalance = parseFloat(cashBalanceRows[0]?.balance || 0);
+
+        if (currentCashBalance < amount) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ 
+                message: `Insufficient cash in hand balance. Available: ${currentCashBalance.toFixed(2)}, Required: ${amount.toFixed(2)}` 
+            });
+        }
+
+        // Format date
+        const formattedDate = date ? date : new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+        // Build purpose including bank and account info
+        let bankName = 'Bank';
+        if (accountInfo.BankID) {
+            try {
+                const [bankRows] = await connection.execute(
+                    'SELECT Name FROM bank WHERE ID = ? AND active = 1',
+                    [accountInfo.BankID]
+                );
+                if (bankRows.length > 0) {
+                    bankName = bankRows[0].Name || bankName;
+                }
+            } catch (bankErr) {
+                console.error('Error fetching bank name:', bankErr);
+            }
+        }
+
+        const accountTitle = accountInfo.AccountTitle || '';
+        const accountNo = accountInfo.AccountNo || '';
+        const basePurpose = purpose || 'Transfer to Bank Account';
+        const transferPurpose = `${basePurpose} - ${bankName} / ${accountTitle}${accountNo ? ' (' + accountNo + ')' : ''}`;
+
+        // Step 1: Add debit entry to cash_in_hand (money going out)
+        const newCashBalance = currentCashBalance - amount;
+        const cashInHandQuery = `
+            INSERT INTO cash_in_hand (
+                debit,
+                credit,
+                balance,
+                purpose,
+                created_at
+            ) VALUES (?, 0, ?, ?, ?)
+        `;
+        const [cashInHandResult] = await connection.execute(cashInHandQuery, [
+            amount,
+            newCashBalance,
+            transferPurpose,
+            formattedDate
+        ]);
+        
+        const cashInHandId = cashInHandResult.insertId;
+
+        // Step 2: Update bank account balance (add amount)
+        const newAccountBalance = currentAccountBalance + amount;
+        await connection.execute(
+            'UPDATE accounts SET Balance = ?, MD = NOW() WHERE ID = ?',
+            [newAccountBalance, accountId]
+        );
+
+        // Step 3: Add transaction record
+        const transactionQuery = `
+            INSERT INTO transactions (
+                AccountID,
+                cash_in_hand_id,
+                Purpose,
+                Debit,
+                Credit,
+                Date,
+                PaymentMode,
+                ReferenceNo,
+                active
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, 1)
+        `;
+        
+        const [transactionResult] = await connection.execute(transactionQuery, [
+            accountId,
+            cashInHandId,
+            transferPurpose,
+            amount, // Credit = money received in bank account
+            formattedDate,
+            paymentMode || null,
+            referenceNo || null
+        ]);
+
+        await connection.commit();
+        connection.release();
+
+        res.json({
+            message: 'Funds transferred successfully',
+            transactionId: transactionResult.insertId,
+            cashInHandId: cashInHandId,
+            newCashBalance: newCashBalance,
+            newAccountBalance: newAccountBalance
+        });
+    } catch (err) {
+        await connection.rollback();
+        connection.release();
+        console.error('Error transferring funds:', err);
+        res.status(500).json({ 
+            message: 'Server Error', 
+            error: err.message 
+        });
     }
 };
 
