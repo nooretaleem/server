@@ -190,8 +190,7 @@ exports.getCashInHandHistoryByDate = async (req, res) => {
         // Use DATE_FORMAT to match dates properly and avoid timezone issues
         // Simply select all columns including balance from the table
         // Only show active records (Active = 1)
-        // Order by balance DESC (highest first) since higher balance = earlier transaction
-        // Then by created_at ASC and id ASC as tiebreakers
+        // Order by created_at ASC (chronological order - oldest first) and id ASC as tiebreaker
         const query = `
             SELECT 
                 id,
@@ -203,7 +202,7 @@ exports.getCashInHandHistoryByDate = async (req, res) => {
                     FROM cash_in_hand
             WHERE DATE_FORMAT(created_at, '%Y-%m-%d') = ?
             AND Active = 1
-            ORDER BY balance DESC, created_at ASC, id ASC
+            ORDER BY created_at ASC, id ASC
         `;
         
         const [rows] = await db.execute(query, [formattedDate]);
