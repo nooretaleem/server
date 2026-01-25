@@ -180,7 +180,7 @@ exports.deleteCustomer = async (req, res) => {
     }
 };
 
-// Get customer sales history from pol_sale table
+// Get customer sales history from pol_sale table with paid amounts from recoveries
 exports.getCustomerSales = async (req, res) => {
     try {
         const client_id = req.query.client_id;
@@ -189,8 +189,19 @@ exports.getCustomerSales = async (req, res) => {
             return res.status(400).json({ message: 'Client ID is required' });
         }
 
-        const query = `
-            SELECT 
+        // First, get total paid amount from recoveries for this customer
+        const totalPaidQuery = `
+            SELECT COALESCE(SUM(Amount), 0) AS total_paid
+            FROM recoveries
+            WHERE ClientID = ? AND Active = 1
+        `;
+        const [paidRows] = await db.execute(totalPaidQuery, [client_id]);
+        const totalPaid = parseFloat(paidRows[0]?.total_paid || 0);
+
+        // Get all sales for this customer with depo information
+        // Match each sale to its specific depo based on trip_id AND product_id (like Trip Distribution)
+        const salesQuery = `
+            SELECT DISTINCT
                 ps.id,
                 ps.date,
                 ps.fuel,
@@ -198,17 +209,73 @@ exports.getCustomerSales = async (req, res) => {
                 ps.Discount,
                 ps.total_amount,
                 ps.container_type,
+                ps.trip_id,
+                ps.trip_product_id,
                 t.trip_no,
-                tp.product_type
+                tp.product_type,
+                td.depo_id,
+                d.name as depo_name
             FROM pol_sale ps
             LEFT JOIN trips t ON ps.trip_id = t.id AND t.active = 1
             LEFT JOIN trip_products tp ON ps.trip_product_id = tp.id AND tp.Active = 1
+            LEFT JOIN trip_depos td ON ps.trip_id = td.trip_id 
+                AND ps.trip_product_id = td.product_id 
+                AND td.Active = 1
+            LEFT JOIN depo d ON td.depo_id = d.id AND d.active = 1
             WHERE ps.client_id = ? AND ps.Active = 1
-            ORDER BY ps.date DESC, ps.id DESC
+            ORDER BY ps.date ASC, ps.id ASC
         `;
         
-        const [rows] = await db.execute(query, [client_id]);
-        res.json(rows);
+        const [salesRows] = await db.execute(salesQuery, [client_id]);
+        
+        // Process sales rows - depo_id is already correctly matched
+        const processedSales = salesRows.map(sale => {
+            return {
+                ...sale,
+                depo_id: sale.depo_id ? parseInt(sale.depo_id, 10) : null,
+                depo_name: sale.depo_name || null
+            };
+        });
+        
+        // Calculate total sales amount (using unique pol_sale records)
+        const totalSales = processedSales.reduce((sum, sale) => sum + parseFloat(sale.total_amount || 0), 0);
+        
+        // Calculate paid amount per sale proportionally
+        // Using FIFO approach: distribute payments to oldest sales first
+        let remainingPaid = totalPaid;
+        const salesWithPaid = processedSales.map((sale) => {
+            const saleAmount = parseFloat(sale.total_amount || 0);
+            let paidAmount = 0;
+            
+            if (remainingPaid > 0 && saleAmount > 0) {
+                if (remainingPaid >= saleAmount) {
+                    // Full payment for this sale
+                    paidAmount = saleAmount;
+                    remainingPaid -= saleAmount;
+                } else {
+                    // Partial payment
+                    paidAmount = remainingPaid;
+                    remainingPaid = 0;
+                }
+            }
+            
+            return {
+                ...sale,
+                paid: paidAmount
+            };
+        });
+        
+        // Sort back to DESC order for display
+        salesWithPaid.sort((a, b) => {
+            const dateA = new Date(a.date);
+            const dateB = new Date(b.date);
+            if (dateA.getTime() !== dateB.getTime()) {
+                return dateB.getTime() - dateA.getTime();
+            }
+            return (b.id || 0) - (a.id || 0);
+        });
+        
+        res.json(salesWithPaid);
     } catch (err) {
         console.error('Error fetching customer sales:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {
@@ -219,7 +286,7 @@ exports.getCustomerSales = async (req, res) => {
     }
 };
 
-// Get customer payments from recoveries table
+// Get customer payments from recoveries table with depo information
 exports.getCustomerPayments = async (req, res) => {
     try {
         const ClientID = req.query.ClientID;
@@ -240,9 +307,13 @@ exports.getCustomerPayments = async (req, res) => {
                 r.MD,
                 r.Active,
                 t.AccountID,
-                t.cash_in_hand_id
+                t.cash_in_hand_id,
+                s.depo_id,
+                d.name as depo_name
             FROM recoveries r
             LEFT JOIN transactions t ON r.transactionID = t.ID
+            LEFT JOIN settlements s ON r.ID = s.recovery_id AND s.Active = 1
+            LEFT JOIN depo d ON s.depo_id = d.id AND d.active = 1
             WHERE r.ClientID = ? AND r.Active = 1
             ORDER BY r.Date DESC, r.ID DESC
         `;
@@ -259,40 +330,52 @@ exports.getCustomerPayments = async (req, res) => {
     }
 };
 
-// Get all customers with their due amounts
+// Get all customers with their due amounts from pol_sale and recoveries tables
 exports.getCustomersDueAmounts = async (req, res) => {
     try {
         const query = `
             SELECT 
-                c.id,
-                c.name as client_name,
-                c.phone as mobile_no,
-                COALESCE(sales.purchased_fuel, 0) as purchased_fuel,
-                COALESCE(sales.amount, 0) as amount,
-                COALESCE(payments.paid, 0) as paid,
-                (COALESCE(sales.amount, 0) - COALESCE(payments.paid, 0)) as due
-            FROM customers c
-            LEFT JOIN (
-                SELECT 
-                    client_id,
-                    SUM(fuel) as purchased_fuel,
-                    SUM(total_amount) as amount
-                FROM pol_sale
-                WHERE Active = 1
-                GROUP BY client_id
-            ) sales ON c.id = sales.client_id
-            LEFT JOIN (
-                SELECT 
-                    ClientID,
-                    SUM(Amount) as paid
-                FROM recoveries
-                WHERE Active = 1
-                GROUP BY ClientID
-            ) payments ON CAST(c.id AS UNSIGNED) = CAST(payments.ClientID AS UNSIGNED)
-            WHERE c.active = 1
-            HAVING (COALESCE(amount, 0) - COALESCE(paid, 0)) > 0 OR COALESCE(amount, 0) > 0
-            ORDER BY due DESC, c.name ASC
-        `;
+  c.id,
+  c.id AS client_id,
+  c.name AS client_name,
+  c.phone AS mobile_no,
+
+  COALESCE(sales.purchased_fuel, 0) AS purchased_fuel,
+  COALESCE(sales.total_amount, 0) AS amount,
+  COALESCE(recoveries.total_paid, 0) AS paid,
+
+  (COALESCE(sales.total_amount, 0) - COALESCE(recoveries.total_paid, 0)) AS due
+
+FROM customers c
+
+LEFT JOIN (
+  SELECT 
+    client_id,
+    SUM(fuel) AS purchased_fuel,
+    SUM(total_amount) AS total_amount
+  FROM pol_sale
+  WHERE Active = 1
+    AND Date >= DATE_SUB(CURDATE(), INTERVAL 1 MONTH)
+  GROUP BY client_id
+) sales ON c.id = sales.client_id
+
+LEFT JOIN (
+  SELECT 
+    ClientID,
+    SUM(Amount) AS total_paid
+  FROM recoveries
+  WHERE Active = 1
+    AND Date >= DATE_SUB(CURDATE(), INTERVAL 1 MONTH)
+  GROUP BY ClientID
+) recoveries ON c.id = recoveries.ClientID
+
+WHERE c.Active = 1
+  AND (
+    COALESCE(sales.total_amount, 0) > 0
+    OR COALESCE(recoveries.total_paid, 0) > 0
+  )
+
+ORDER BY due DESC, c.name ASC`;
         
         const [rows] = await db.execute(query);
         res.json(rows);

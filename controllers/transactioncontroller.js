@@ -115,8 +115,38 @@ exports.addPayment = async (req, res) => {
             }
 
             const currentDepoBalance = parseFloat(depoRows[0].Balance || 0);
-            const newDepoBalance = currentDepoBalance + Amount;
             const depoName = depoRows[0].name || `Depo ${DepoID}`;
+            
+            // Advance balance is stored in advance_balance table (latest Balance)
+            const [advanceRows] = await connection.execute(
+                `SELECT COALESCE(Balance, 0) as advance_balance
+                 FROM advance_balance
+                 WHERE DepoID = ? AND Active = 1
+                 ORDER BY ID DESC
+                 LIMIT 1`,
+                [DepoID]
+            );
+            const currentAdvanceBalance = parseFloat(advanceRows[0]?.advance_balance || 0);
+
+            // Get initial balance limit from pool table (first entry with NULL tripID, payment_id, recovery_id)
+            const [initialBalanceRows] = await connection.execute(
+                `SELECT Credit as initial_balance
+                 FROM pool 
+                 WHERE DepoID = ? 
+                   AND TripID IS NULL 
+                   AND payment_id IS NULL 
+                   AND recovery_id IS NULL 
+                   AND active = 1 
+                 ORDER BY ID ASC 
+                 LIMIT 1`,
+                [DepoID]
+            );
+            
+            const initialBalance = initialBalanceRows.length > 0 
+                ? parseFloat(initialBalanceRows[0].initial_balance || 0) 
+                : currentDepoBalance; // Fallback to current balance if no initial entry found
+            
+            console.log(`Depo ${DepoID} (${depoName}) initial balance limit: ${initialBalance}, current balance: ${currentDepoBalance}, current advance: ${currentAdvanceBalance}`);
 
             // 1.5. Check remaining balance for this dealer - calculate from trip_depos
             const [remainingBalanceRows] = await connection.execute(
@@ -130,19 +160,143 @@ exports.addPayment = async (req, res) => {
             
             const remainingBalance = parseFloat(remainingBalanceRows[0]?.remaining_balance || 0);
             
-            if (Amount > remainingBalance) {
+            // Payment validation: Allow payment if remainingBalance = 0 (advance payment) or if Amount <= remainingBalance
+            if (remainingBalance === 0) {
+                // Advance payment: Add to advance_balance table instead of depo.advance_balance
+                
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [DepoID]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + Amount;
+                
+                // Create transaction for advance payment (no trip association)
+                const transactionQuery = `
+                    INSERT INTO transactions (
+                        AccountID, 
+                        Purpose, 
+                        Debit, 
+                        Credit, 
+                        Date, 
+                        PaymentMode, 
+                        ReferenceNo,
+                        trip_id,
+                        active
+                    ) VALUES (?, ?, ?, 0, NOW(), ?, ?, NULL, 1)
+                `;
+                
+                const [transactionResult] = await connection.execute(transactionQuery, [
+                    AccountID,
+                    `Advance Payment to ${depoName}`,
+                    Amount,
+                    PaymentMode,
+                    ReferenceNo || null
+                ]);
+                
+                const transactionID = transactionResult.insertId;
+                
+                // Create payment record for advance payment
+                const paymentQuery = `
+                    INSERT INTO payments (
+                        transactionID, 
+                        DepoID,
+                        trip_id,
+                        Amount, 
+                        Date, 
+                        active
+                    ) VALUES (?, ?, NULL, ?, NOW(), 1)
+                `;
+                
+                const [paymentResult] = await connection.execute(paymentQuery, [
+                    transactionID,
+                    DepoID,
+                    Amount
+                ]);
+                
+                const paymentID = paymentResult.insertId;
+                
+                // Update Accounts table - subtract amount from balance
+                const updateAccountQuery = `
+                    UPDATE accounts 
+                    SET Balance = Balance - ?, 
+                        MD = NOW()
+                    WHERE ID = ? AND active = 1
+                `;
+                
+                await connection.execute(updateAccountQuery, [Amount, AccountID]);
+                
+                // Insert Credit entry to advance_balance table
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, NULL, ?, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [DepoID, paymentID, Amount, newAdvanceBalanceInTable, 'admin@gmail.com']
+                );
+                console.log(`Added advance_balance entry for advance payment: Credit=${Amount}, New Balance=${newAdvanceBalanceInTable}`);
+                
+                await connection.commit();
+                connection.release();
+                
+                return res.json({
+                    message: 'Advance payment added successfully',
+                    transactionID: transactionID,
+                    paymentID: paymentResult.insertId,
+                    advanceBalance: newAdvanceBalanceInTable
+                });
+            } else if (Amount > remainingBalance) {
+                // Payment exceeds remaining balance
                 await connection.rollback();
                 connection.release();
                 return res.status(400).json({ 
                     message: `Payment amount exceeds remaining balance. Remaining balance: ${remainingBalance.toFixed(2)}, Required payment: ${Amount.toFixed(2)}` 
                 });
             }
+            
+            // Normal payment flow: remainingBalance > 0 and Amount <= remainingBalance
+            // Calculate how much can be added to Balance (up to initial limit) and how much to advance_balance
+            const balanceSpaceAvailable = Math.max(0, initialBalance - currentDepoBalance);
+            const amountToBalance = Math.min(Amount, balanceSpaceAvailable);
+            const amountToAdvanceBalance = Amount - amountToBalance;
+            
+            const newDepoBalance = currentDepoBalance + amountToBalance;
+            const newAdvanceBalance = currentAdvanceBalance + amountToAdvanceBalance;
 
-            // Update depo balance (once for the full amount)
+            // Update depo balance (only the Balance column, not advance_balance)
             await connection.execute(
                 `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
                 [newDepoBalance, DepoID]
             );
+            console.log(`Updated depo ${DepoID}: Balance=${newDepoBalance} (added ${amountToBalance})`);
+
+            // Add advance_balance table entry if there's excess payment (Credit entry)
+            if (amountToAdvanceBalance > 0) {
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [DepoID]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + amountToAdvanceBalance;
+                
+                // Insert Credit entry to advance_balance table
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, NULL, NULL, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [DepoID, amountToAdvanceBalance, newAdvanceBalanceInTable, 'admin@gmail.com']
+                );
+                console.log(`Added advance_balance entry: Credit=${amountToAdvanceBalance}, New Balance=${newAdvanceBalanceInTable}`);
+            }
 
             // 2. Find trips for this depo that have remaining balance using trip_depos table - FIFO
             const [tripsWithBalance] = await connection.execute(
@@ -924,9 +1078,20 @@ exports.addCashInHandPayment = async (req, res) => {
                 });
             }
 
-            // 2. Get Depo Name and Balance
+            // 2. Get Depo Name, Balance and advance balance (advance is stored in advance_balance table)
             const [depoRows] = await connection.execute(
-                'SELECT name, Balance FROM depo WHERE id = ?',
+                `SELECT 
+                    d.name, 
+                    d.Balance,
+                    (
+                        SELECT COALESCE(ab.Balance, 0)
+                        FROM advance_balance ab
+                        WHERE ab.DepoID = d.id AND ab.Active = 1
+                        ORDER BY ab.ID DESC
+                        LIMIT 1
+                    ) as advance_balance
+                 FROM depo d
+                 WHERE d.id = ?`,
                 [DepoID]
             );
             
@@ -938,7 +1103,27 @@ exports.addCashInHandPayment = async (req, res) => {
             
             const depoName = depoRows[0].name || `Depo ${DepoID}`;
             const currentDepoBalance = parseFloat(depoRows[0].Balance || 0);
-            const newDepoBalance = currentDepoBalance + Amount;
+            const currentAdvanceBalance = parseFloat(depoRows[0].advance_balance || 0);
+
+            // Get initial balance limit from pool table (first entry with NULL tripID, payment_id, recovery_id)
+            const [initialBalanceRows] = await connection.execute(
+                `SELECT Credit as initial_balance
+                 FROM pool 
+                 WHERE DepoID = ? 
+                   AND TripID IS NULL 
+                   AND payment_id IS NULL 
+                   AND recovery_id IS NULL 
+                   AND active = 1 
+                 ORDER BY ID ASC 
+                 LIMIT 1`,
+                [DepoID]
+            );
+            
+            const initialBalance = initialBalanceRows.length > 0 
+                ? parseFloat(initialBalanceRows[0].initial_balance || 0) 
+                : currentDepoBalance; // Fallback to current balance if no initial entry found
+            
+            console.log(`[Cash Payment] Depo ${DepoID} (${depoName}) initial balance limit: ${initialBalance}, current balance: ${currentDepoBalance}, current advance: ${currentAdvanceBalance}`);
 
             // 2.5. Check remaining balance for this dealer - calculate from trip_depos
             const [remainingBalanceRows] = await connection.execute(
@@ -952,13 +1137,120 @@ exports.addCashInHandPayment = async (req, res) => {
             
             const remainingBalance = parseFloat(remainingBalanceRows[0]?.remaining_balance || 0);
             
-            if (Amount > remainingBalance) {
+            // Payment validation: Allow payment if remainingBalance = 0 (advance payment) or if Amount <= remainingBalance
+            if (remainingBalance === 0) {
+                // Advance payment: Add to advance_balance table instead of depo.advance_balance
+                
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [DepoID]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + Amount;
+                
+                // Create cash_in_hand entry (debit - money going out)
+                const [lastBalanceRows2] = await connection.execute(
+                    `SELECT balance FROM cash_in_hand 
+                     WHERE Active = 1 
+                     ORDER BY created_at DESC, id DESC 
+                     LIMIT 1`
+                );
+                const currentCashBalance = lastBalanceRows2.length > 0 
+                    ? parseFloat(lastBalanceRows2[0]?.balance || 0) 
+                    : 0;
+                const newCashBalance = currentCashBalance - Amount;
+                
+                const [cashInHandResult] = await connection.execute(
+                    `INSERT INTO cash_in_hand (debit, credit, balance, purpose, created_at, active)
+                     VALUES (?, 0, ?, ?, NOW(), 1)`,
+                    [Amount, newCashBalance, `Advance Payment to ${depoName}`]
+                );
+                
+                const cashInHandId = cashInHandResult.insertId;
+                
+                // Create transaction for advance payment
+                const transactionQuery = `
+                    INSERT INTO transactions (
+                        cash_in_hand_id,
+                        Purpose, 
+                        Debit, 
+                        Credit, 
+                        Date, 
+                        active
+                    ) VALUES (?, ?, ?, 0, NOW(), 1)
+                `;
+                
+                const [transactionResult] = await connection.execute(transactionQuery, [
+                    cashInHandId,
+                    `Advance Payment to ${depoName}`,
+                    Amount
+                ]);
+                
+                const transactionID = transactionResult.insertId;
+                
+                // Create payment record for advance payment
+                const paymentQuery = `
+                    INSERT INTO payments (
+                        transactionID, 
+                        DepoID,
+                        trip_id,
+                        Amount, 
+                        Date, 
+                        active
+                    ) VALUES (?, ?, NULL, ?, NOW(), 1)
+                `;
+                
+                const [paymentResult] = await connection.execute(paymentQuery, [
+                    transactionID,
+                    DepoID,
+                    Amount
+                ]);
+                
+                const paymentID = paymentResult.insertId;
+                
+                // Insert Credit entry to advance_balance table
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, NULL, ?, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [DepoID, paymentID, Amount, newAdvanceBalanceInTable, 'admin@gmail.com']
+                );
+                console.log(`Added advance_balance entry for advance payment: Credit=${Amount}, New Balance=${newAdvanceBalanceInTable}`);
+                
+                await connection.commit();
+                connection.release();
+                
+                return res.json({
+                    message: 'Advance payment added successfully',
+                    transactionID: transactionID,
+                    paymentID: paymentResult.insertId,
+                    cashInHandId: cashInHandId,
+                    advanceBalance: newAdvanceBalanceInTable
+                });
+            } else if (Amount > remainingBalance) {
+                // Payment exceeds remaining balance
                 await connection.rollback();
                 connection.release();
                 return res.status(400).json({ 
                     message: `Payment amount exceeds remaining balance. Remaining balance: ${remainingBalance.toFixed(2)}, Required payment: ${Amount.toFixed(2)}` 
                 });
             }
+            
+            // Normal payment flow: remainingBalance > 0 and Amount <= remainingBalance
+            // Calculate how much can be added to Balance (up to initial limit) and how much to advance_balance
+            const balanceSpaceAvailable = Math.max(0, initialBalance - currentDepoBalance);
+            const amountToBalance = Math.min(Amount, balanceSpaceAvailable);
+            const amountToAdvanceBalance = Amount - amountToBalance;
+            
+            const newDepoBalance = currentDepoBalance + amountToBalance;
+            const newAdvanceBalance = currentAdvanceBalance + amountToAdvanceBalance;
+            
+            console.log(`[Cash Payment] Will add ${amountToBalance} to Balance (space available: ${balanceSpaceAvailable}), ${amountToAdvanceBalance} to advance_balance`);
 
             // 3. Get Trip No if TripID is provided
             let tripNo = TripNo || '';
@@ -1135,11 +1427,36 @@ exports.addCashInHandPayment = async (req, res) => {
                 console.log(`Created transaction ${transactionID}, payment ${paymentId}, and pool record for trip ${trip.id} (trip_depo ${tripDepoId}). Applied ${paymentToApply}, New paid_amount: ${newPaidAmount}, Pool balance: ${runningPoolBalance}, Remaining: ${payableAmount - newPaidAmount}`);
             }
 
-            // 8. Update depo balance (once for the full amount)
+            // 8. Update depo balance (only Balance column, not advance_balance)
             await connection.execute(
                 `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
                 [newDepoBalance, DepoID]
             );
+            console.log(`Updated depo ${DepoID}: Balance=${newDepoBalance} (added ${amountToBalance})`);
+
+            // Add advance_balance table entry if there's excess payment (Credit entry)
+            if (amountToAdvanceBalance > 0) {
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [DepoID]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + amountToAdvanceBalance;
+                
+                // Insert Credit entry to advance_balance table
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, NULL, NULL, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [DepoID, amountToAdvanceBalance, newAdvanceBalanceInTable, 'admin@gmail.com']
+                );
+                console.log(`Added advance_balance entry: Credit=${amountToAdvanceBalance}, New Balance=${newAdvanceBalanceInTable}`);
+            }
 
             // Commit transaction
             await connection.commit();

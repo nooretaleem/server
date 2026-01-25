@@ -50,12 +50,13 @@ async function checkAndCloseTrip(connection, tripId) {
 // Helper function to recalculate all balances in cash_in_hand table
 async function recalculateAllBalances(connection) {
     try {
-        // Get all records ordered by created_at and id where active = 1
+        // Get all active records ordered by id ASC (IDs are sequential and represent insertion order)
+        // This ensures correct balance calculation regardless of created_at timestamp issues
         const [allRecords] = await connection.execute(`
             SELECT id, debit, credit
             FROM cash_in_hand
             WHERE Active = 1
-            ORDER BY created_at ASC, id ASC
+            ORDER BY id ASC
         `);
         
         let runningBalance = 0;
@@ -73,6 +74,50 @@ async function recalculateAllBalances(connection) {
         }
     } catch (err) {
         console.error('Error recalculating balances:', err);
+        throw err;
+    }
+}
+
+// Helper function to recalculate advance_balance balances for a depo
+// Recalculates all active rows in chronological order
+async function recalculateAdvanceBalances(connection, depoId) {
+    try {
+        // Get all active advance_balance rows for this depo, ordered by ID (chronological)
+        const [advanceRows] = await connection.execute(
+            `SELECT ID, Debit, Credit, Balance
+             FROM advance_balance
+             WHERE DepoID = ? AND Active = 1
+             ORDER BY ID ASC`,
+            [depoId]
+        );
+
+        if (advanceRows.length === 0) {
+            console.log(`No advance_balance rows found for depo ${depoId}`);
+            return 0; // Return 0 if no rows
+        }
+
+        let runningBalance = 0;
+
+        // Recalculate Balance for each row: Balance = previous Balance - Debit + Credit
+        for (const row of advanceRows) {
+            const debit = parseFloat(row.Debit) || 0;
+            const credit = parseFloat(row.Credit) || 0;
+            
+            // Calculate new balance: previous balance - debit + credit
+            runningBalance = runningBalance - debit + credit;
+            
+            // Update this row's Balance
+            await connection.execute(
+                `UPDATE advance_balance SET Balance = ? WHERE ID = ?`,
+                [runningBalance, row.ID]
+            );
+            
+            console.log(`Recalculated advance_balance row ${row.ID}: New Balance=${runningBalance} (Debit=${debit}, Credit=${credit})`);
+        }
+
+        return runningBalance; // Return final balance
+    } catch (err) {
+        console.error('Error recalculating advance balances:', err);
         throw err;
     }
 }
@@ -381,7 +426,7 @@ exports.addTrip = async (req, res) => {
             cpl, // May be null (products stored in trip_products)
             products, // Array of products
             spl,
-            amount_collected,
+            amount_collected, 
             paid,
             payment_method,
             account_head,
@@ -442,10 +487,11 @@ exports.addTrip = async (req, res) => {
 
         // Validate payment fields per product (account_head is now per product, not at trip level)
         const hasCashOrAdvanceProducts = products && products.some(p => p.purchase_type === 'cash' || p.purchase_type === 'advance');
-        
+       
         for (let i = 0; i < products.length; i++) {
             const product = products[i];
             if (product.purchase_type === 'cash' || product.purchase_type === 'advance') {
+                product.account_head='Advance Balance';
                 if (!product.account_head) {
                     return res.status(400).json({ 
                         message: `Product ${i + 1}: Account Head is required for Full Payment or Partial Payment purchase types` 
@@ -477,7 +523,7 @@ exports.addTrip = async (req, res) => {
             await connection.beginTransaction();
             
             // Get CB (Created By) once for the entire function
-            const CB = req.body.CB || 'System'; // Created By (user ID or username), default to 'System' if not provided
+            const CB = req.body.CB || 'Admin'; // Created By (user ID or username), default to 'System' if not provided
 
             // Check depo balance for each depo separately
             // Only check balance for products with credit purchase_type
@@ -506,7 +552,18 @@ exports.addTrip = async (req, res) => {
                 // Check balance for each depo with credit products
                 for (const depoId of Object.keys(depoCosts)) {
                     const [depoRows] = await connection.execute(
-                        `SELECT Balance, name FROM depo WHERE id = ? AND active = 1`,
+                        `SELECT 
+                            d.Balance,
+                            d.name,
+                            (
+                                SELECT COALESCE(ab.Balance, 0)
+                                FROM advance_balance ab
+                                WHERE ab.DepoID = d.id AND ab.Active = 1
+                                ORDER BY ab.ID DESC
+                                LIMIT 1
+                            ) as advance_balance
+                         FROM depo d
+                         WHERE d.id = ? AND d.active = 1`,
                         [depoId]
                     );
 
@@ -519,17 +576,24 @@ exports.addTrip = async (req, res) => {
                     }
 
                     const depoBalance = parseFloat(depoRows[0].Balance || 0);
+                    const advanceBalance = parseFloat(depoRows[0].advance_balance || 0);
                     const depoName = depoRows[0].name || `Depo ${depoId}`;
                     depoBalances[depoId] = depoBalance;
                     depoNames[depoId] = depoName;
                     const totalCost = depoCosts[depoId];
 
-                    // Check if depo balance is sufficient for credit products
-                    if (totalCost > depoBalance) {
+                    // Calculate total available: advance_balance + (credit_limit - used_credit)
+                    // For now, used_credit is the amount already used from Balance
+                    // So available credit = Balance (remaining credit limit)
+                    const totalAvailable = advanceBalance + depoBalance;
+
+                    // Check if total available (advance + credit) is sufficient for credit products
+                    if (totalCost > totalAvailable) {
                         await connection.rollback();
                         connection.release();
                         return res.status(400).json({ 
-                            message: `Total cost (Rs. ${totalCost.toFixed(2)}) for credit products exceeds the depo balance (Rs. ${depoBalance.toFixed(2)}) for depo "${depoName}". ` +
+                            message: `Total cost (Rs. ${totalCost.toFixed(2)}) for credit products exceeds available funds (Rs. ${totalAvailable.toFixed(2)}) for depo "${depoName}". ` +
+                                     `Available: Advance (Rs. ${advanceBalance.toFixed(2)}) + Credit (Rs. ${depoBalance.toFixed(2)}). ` +
                                      `Please reduce quantities or increase the depo balance.` 
                         });
                     }
@@ -568,6 +632,9 @@ exports.addTrip = async (req, res) => {
             // Arrays to store transaction IDs and cash_in_hand IDs (declared outside if block for accessibility)
             const transactionIDsForTrip = []; // Array to store all transaction IDs created
             const cashInHandIdsForTransaction = []; // Array to store cash_in_hand IDs
+            // Track advance_balance table entry IDs that need to be linked to the newly created TripID
+            // (key: depoId, value: advance_balance.ID)
+            let advanceBalanceEntryIds = {};
             
             // Handle payment transactions per product (account_head is now per product)
             // Process payments for each product with cash or advance purchase type
@@ -576,7 +643,7 @@ exports.addTrip = async (req, res) => {
                 const productsByAccountHead = {};
                 products.forEach((product, index) => {
                     if (product.purchase_type === 'cash' || product.purchase_type === 'advance') {
-                        const accountHead = product.account_head;
+                        const accountHead = 'Advance Balance';//product.account_head;
                         if (!productsByAccountHead[accountHead]) {
                             productsByAccountHead[accountHead] = [];
                         }
@@ -684,6 +751,43 @@ exports.addTrip = async (req, res) => {
                             connection.release();
                             return res.status(404).json({ message: 'Account not found or inactive' });
                         }
+                    }
+                    else if (accountHead === 'Advance Balance') {
+                        // Advance Balance payment - payment is handled through depo advance_balance
+                        // Create transaction entry with account_head='Advance Balance', cash_in_hand_id=null, account_id=null
+                        const hasAdvance = productGroup.some(({ product }) => product.purchase_type === 'advance');
+                        const hasCash = productGroup.some(({ product }) => product.purchase_type === 'cash');
+                        let purpose = 'Payment from Advance Balance';
+                        if (hasAdvance && hasCash) {
+                            purpose = 'Mixed Payment from Advance Balance';
+                        } else if (hasAdvance) {
+                            purpose = 'Advance Payment from Advance Balance';
+                        } else if (hasCash) {
+                            purpose = 'Full Payment from Advance Balance';
+                        }
+                        
+                        const transactionQuery = `
+                            INSERT INTO transactions (
+                                cash_in_hand_id,
+                                AccountID,
+                                Purpose, 
+                                Debit, 
+                                Credit, 
+                                PaymentMode,
+                                ReferenceNo,
+                                Date,
+                                trip_id,
+                                active
+                            ) VALUES (NULL, NULL, ?, ?, 0, NULL, NULL, NOW(), NULL, 1)
+                        `;
+                        
+                        const [transactionResult] = await connection.execute(transactionQuery, [
+                            purpose,
+                            groupTotal
+                        ]);
+                        
+                        transactionIDsForTrip.push(transactionResult.insertId);
+                        console.log(`Created transaction for Advance Balance payment: Amount=${groupTotal}, TransactionID=${transactionResult.insertId}`);
                     } else if (accountHead === 'cash_in_hand') {
                         // Cash in Hand payment - when paying out, use debit
                         // 1. Get current cash in hand balance from last active entry
@@ -955,6 +1059,17 @@ exports.addTrip = async (req, res) => {
         
         console.log('Add Trip - Final tripInsertId:', tripInsertId);
 
+        // Update advance_balance entries with TripID
+        if (advanceBalanceEntryIds && Object.keys(advanceBalanceEntryIds).length > 0) {
+            for (const [depoId, entryId] of Object.entries(advanceBalanceEntryIds)) {
+                await connection.execute(
+                    `UPDATE advance_balance SET TripID = ?, MD = NOW() WHERE ID = ?`,
+                    [tripInsertId, entryId]
+                );
+                console.log(`Updated advance_balance entry ${entryId} with TripID=${tripInsertId} for depo ${depoId}`);
+            }
+        }
+
             // Insert transaction for credit (loan) products only
             const creditProducts = products && products.filter(p => p.purchase_type === 'credit');
             if (tripInsertId && creditProducts && creditProducts.length > 0) {
@@ -1124,7 +1239,13 @@ exports.addTrip = async (req, res) => {
                             payableAmount = purchaseAmount;
                         }
                         
+                        // Safety: paid_amount must never exceed payable_amount
+                        if (paidAmount > payableAmount) {
+                            paidAmount = payableAmount;
+                        }
+                        
                         // Insert trip_depos entry for this specific product with its product_id
+                        // NOTE: advance usage is tracked in the advance_balance table (not trip_depos.advance_balance)
                         console.log(`Inserting trip_depos: trip_id=${tripInsertId}, depo_id=${depoId}, product_id=${productId}, purchase_type=${purchaseType}, paid_amount=${paidAmount}, payable_amount=${payableAmount}`);
                         await connection.execute(insertTripDeposQuery, [
                             tripInsertId,
@@ -1162,105 +1283,116 @@ exports.addTrip = async (req, res) => {
                 // If pool entry creation fails, the transaction will be rolled back
                 // Only create pool entries for credit and advance purchases (NOT for cash/full payment)
                 try {
-                    // Create pool entries directly from depoPurchaseData for credit and advance purchases only
-                    // Full payment purchases don't need pool entries since they're fully paid and don't affect credit limit
-                    // We need to group by depo_id to calculate total credit/advance amount per depo for pool entry
-                    const depoPoolData = {};
+                    // Compute (1) advance consumption and (2) credit usage from depoPurchaseData.
+                    // Frontend auto-select rules:
+                    // - If Advance Balance >= Purchase Amount => purchase_type=cash (fully paid from advance balance)
+                    // - If 0 < Advance Balance < Purchase Amount => purchase_type=advance (partially paid from advance balance)
+                    // - If Advance Balance = 0 => purchase_type=credit (unpaid; uses credit limit)
+                    const advanceConsumedByDepo = {}; // sum(paid_amount) for cash/advance
+                    const creditUsedByDepo = {};      // sum((payable_amount - paid_amount)) for credit/advance
                     
-                    // Aggregate credit and advance purchases by depo_id for pool entries
                     for (const depoData of Object.values(depoPurchaseData)) {
-                        console.log(`Processing depoPurchaseData for pool: depo_id=${depoData.depo_id}, purchase_type=${depoData.purchase_type}, payable_amount=${depoData.payable_amount}`);
-                        
-                        // Skip cash purchases - they don't affect credit limit
-                        if (depoData.purchase_type === 'cash') {
-                            console.log(`Skipping cash purchase for depo ${depoData.depo_id} - no pool entry needed`);
-                            continue;
-                        }
-                        
                         const depoId = depoData.depo_id;
-                        const payableAmount = parseFloat(depoData.payable_amount || 0);
+                        const purchaseType = depoData.purchase_type || 'credit';
+                        const payableAmount = parseFloat(depoData.payable_amount || 0) || 0;
+                        const paidAmount = parseFloat(depoData.paid_amount || 0) || 0;
+                        const safePaid = Math.min(paidAmount, payableAmount);
+                        const remainingDue = Math.max(0, payableAmount - safePaid);
                         
-                        console.log(`Processing credit/advance purchase for pool: depo_id=${depoId}, purchase_type=${depoData.purchase_type}, payable_amount=${payableAmount}`);
+                        if (purchaseType === 'cash' || purchaseType === 'advance') {
+                            if (!advanceConsumedByDepo[depoId]) advanceConsumedByDepo[depoId] = 0;
+                            advanceConsumedByDepo[depoId] += safePaid;
+                        }
                         
-                        // Only process if there's a payable amount (credit or advance with remaining balance)
-                        if (payableAmount > 0) {
-                            if (!depoPoolData[depoId]) {
-                                depoPoolData[depoId] = {
-                                    depo_id: depoId,
-                                    total_payable_amount: 0
-                                };
-                                console.log(`Initialized pool data for depo ${depoId}`);
-                            }
-                            // Sum up all payable amounts for this depo (credit + advance purchases)
-                            depoPoolData[depoId].total_payable_amount += payableAmount;
-                            console.log(`Added payable amount ${payableAmount} to depo ${depoId}. New total: ${depoPoolData[depoId].total_payable_amount}`);
-                        } else {
-                            console.log(`Skipping depo ${depoId} - payable_amount is 0 or invalid`);
+                        // Any remaining due after paid_amount should hit credit limit (pool debit + depo.Balance reduction)
+                        if (remainingDue > 0) {
+                            if (!creditUsedByDepo[depoId]) creditUsedByDepo[depoId] = 0;
+                            creditUsedByDepo[depoId] += remainingDue;
                         }
                     }
                     
-                    console.log(`Creating pool entries for ${Object.keys(depoPoolData).length} depo(s) with credit/advance purchases`);
-                    if (Object.keys(depoPoolData).length === 0) {
-                        console.log('WARNING: No pool entries will be created. Check if all purchases are cash type.');
-                    }
+                    const allDepoIds = Array.from(new Set([
+                        ...Object.keys(advanceConsumedByDepo).map(k => parseInt(k, 10)),
+                        ...Object.keys(creditUsedByDepo).map(k => parseInt(k, 10))
+                    ])).filter(n => !isNaN(n));
                     
-                    // Create pool entries for each depo that has credit/advance purchases
-                    for (const poolData of Object.values(depoPoolData)) {
-                        const depoId = poolData.depo_id;
-                        const totalPayableAmount = poolData.total_payable_amount;
+                    console.log(`addTrip pool/advance processing: depos=${allDepoIds.join(', ') || 'N/A'}`);
+                    
+                    for (const depoId of allDepoIds) {
+                        const advanceConsumed = parseFloat(advanceConsumedByDepo[depoId] || 0) || 0;
+                        const creditUsed = parseFloat(creditUsedByDepo[depoId] || 0) || 0;
                         
-                        if (totalPayableAmount > 0) {
-                                // Get last depo limit from pool table (previous row's balance)
-                            // Get the latest entry regardless of active status to get the current balance
-                            // All pool entries are created with active=1
-                            // We want the most recent transaction to get the current DepoLimit
-                                const [poolRows] = await connection.execute(
-                                `SELECT ID, DepoLimit FROM pool WHERE DepoID = ? ORDER BY ID DESC LIMIT 1`,
-                                    [depoId]
-                                );
-                                
-                            // Get current depo balance as fallback (initial balance from depo table)
-                                const [depoBalanceRows] = await connection.execute(
-                                    `SELECT Balance FROM depo WHERE id = ? AND active = 1`,
-                                    [depoId]
-                                );
-                                const currentDepoBalance = depoBalanceRows.length > 0 ? parseFloat(depoBalanceRows[0].Balance || 0) : 0;
-                                
-                            // Use the latest pool entry's DepoLimit if available, otherwise use depo's initial Balance
-                                const previousBalance = poolRows.length > 0 ? parseFloat(poolRows[0].DepoLimit || 0) : currentDepoBalance;
-                                
-                            console.log(`For depo ${depoId}: Previous pool balance=${previousBalance}, Current depo balance=${currentDepoBalance}`);
+                        // 1) Consume advance (insert Debit entry in advance_balance with TripID)
+                        if (advanceConsumed > 0) {
+                            const [lastAdvanceRows] = await connection.execute(
+                                `SELECT Balance FROM advance_balance
+                                 WHERE DepoID = ? AND Active = 1
+                                 ORDER BY ID DESC LIMIT 1`,
+                                [depoId]
+                            );
+                            const currentAdvanceBalance = lastAdvanceRows.length > 0
+                                ? parseFloat(lastAdvanceRows[0].Balance || 0)
+                                : 0;
+                            const newAdvanceBalance = Math.max(0, currentAdvanceBalance - advanceConsumed);
                             
-                            // For credit/advance purchases, this is a DEBIT (money going out from depo to trip)
-                            // Full payment (cash) purchases don't create pool entries - they're fully paid upfront
-                                // New DepoLimit = Previous Balance - Total Payable Amount
-                                const newDepoLimit = previousBalance - totalPayableAmount;
-                                
-                                const poolQuery = `
-                                    INSERT INTO pool (
-                                        DepoID, 
-                                        TripID,
-                                        Debit, 
-                                        Credit, 
-                                        DepoLimit,
-                                        payment_id,
-                                        recovery_id,
-                                        CD,
-                                        CB,
-                                        MD,
-                                        active
-                                    ) VALUES (?, ?, ?, 0, ?, NULL, NULL, NOW(), ?, NOW(), 1)
-                                `;
-                                
-                                await connection.execute(poolQuery, [
-                                    depoId,
-                                    tripInsertId,  // TripID set
-                                totalPayableAmount,  // Debit = total payable_amount for this depo (credit/advance only)
-                                    newDepoLimit,  // New DepoLimit = Previous Balance - Total Payable
-                                    CB
-                                ]);
-                                
-                            console.log(`Successfully inserted pool record for trip ${tripInsertId}, depo ${depoId}: Debit=${totalPayableAmount}, Previous Balance=${previousBalance}, New DepoLimit=${newDepoLimit}`);
+                            await connection.execute(
+                                `INSERT INTO advance_balance (
+                                    DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                                ) VALUES (?, ?, NULL, NULL, ?, 0, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                                [depoId, tripInsertId, advanceConsumed, newAdvanceBalance, CB]
+                            );
+                            
+                            console.log(`Consumed advance for trip ${tripInsertId}, depo ${depoId}: Debit=${advanceConsumed}, NewAdvanceBalance=${newAdvanceBalance}`);
+                        }
+                        
+                        // 2) Use credit limit for remaining due (pool debit + depo.Balance reduction)
+                        if (creditUsed > 0) {
+                            const [depoBalanceRows] = await connection.execute(
+                                `SELECT Balance FROM depo WHERE id = ? AND active = 1`,
+                                [depoId]
+                            );
+                            const currentDepoBalance = depoBalanceRows.length > 0 ? parseFloat(depoBalanceRows[0].Balance || 0) : 0;
+                            const newDepoBalance = currentDepoBalance - creditUsed;
+                            
+                            // Update depo.Balance (credit limit remaining)
+                            await connection.execute(
+                                `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
+                                [newDepoBalance, depoId]
+                            );
+                            
+                            // Previous DepoLimit from pool (running credit limit)
+                            const [poolRows] = await connection.execute(
+                                `SELECT DepoLimit FROM pool WHERE DepoID = ? AND active = 1 ORDER BY ID DESC LIMIT 1`,
+                                [depoId]
+                            );
+                            const previousDepoLimit = poolRows.length > 0 ? parseFloat(poolRows[0].DepoLimit || 0) : currentDepoBalance;
+                            const newDepoLimit = previousDepoLimit - creditUsed;
+                            
+                            const poolQuery = `
+                                INSERT INTO pool (
+                                    DepoID,
+                                    TripID,
+                                    Debit,
+                                    Credit,
+                                    DepoLimit,
+                                    payment_id,
+                                    recovery_id,
+                                    CD,
+                                    CB,
+                                    MD,
+                                    active
+                                ) VALUES (?, ?, ?, 0, ?, NULL, NULL, NOW(), ?, NOW(), 1)
+                            `;
+                            
+                            await connection.execute(poolQuery, [
+                                depoId,
+                                tripInsertId,
+                                creditUsed,
+                                newDepoLimit,
+                                CB
+                            ]);
+                            
+                            console.log(`Pool debit for trip ${tripInsertId}, depo ${depoId}: Debit=${creditUsed}, PreviousDepoLimit=${previousDepoLimit}, NewDepoLimit=${newDepoLimit}`);
                         }
                     }
                     
@@ -1607,19 +1739,100 @@ exports.deleteTrip = async (req, res) => {
 
         const trip = tripRows[0];
         
-        // Get depo_ids from trip_depos table for logging
+        // Get depo_ids from trip_depos table for logging and advance_balance restoration
         let depoIds = [];
+        let totalTripAdvance = 0;
         try {
             const [depoRows] = await connection.execute(
-                'SELECT depo_id FROM trip_depos WHERE trip_id = ? AND Active = 1',
+                'SELECT DISTINCT depo_id FROM trip_depos WHERE trip_id = ? AND Active = 1',
                 [id]
             );
             depoIds = depoRows.map(r => r.depo_id);
+            
+            // Calculate total advance balance used in this trip
+            // NOTE: Advance usage is recorded as Debit entries in advance_balance table linked by TripID.
+            const [advanceSum] = await connection.execute(
+                `SELECT COALESCE(SUM(ab.Debit), 0) as total_advance
+                 FROM advance_balance ab
+                 WHERE ab.TripID = ?
+                   AND ab.Active = 1
+                   AND ab.Debit > 0`,
+                [id]
+            );
+            totalTripAdvance = parseFloat(advanceSum[0]?.total_advance || 0);
         } catch (err) {
             console.log('Error getting depo_ids from trip_depos:', err.message);
         }
         
-        console.log(`Starting soft delete for trip ${id} (${trip.trip_no}). DepoIDs: ${depoIds.join(', ') || 'N/A'}`);
+        console.log(`Starting soft delete for trip ${id} (${trip.trip_no}). DepoIDs: ${depoIds.join(', ') || 'N/A'}. Advance Balance: ${totalTripAdvance}`);
+
+        // Step 0: Soft delete advance_balance rows for this trip and recalculate balances
+        let advanceDeletionSummary = [];
+        try {
+            console.log(`Starting advance_balance soft delete for trip ${id}`);
+            
+            // Get all advance_balance records for this trip (both Debit and Credit entries)
+            const [advanceRows] = await connection.execute(
+                `SELECT ab.ID, ab.DepoID, ab.Debit, ab.Credit, d.name as depo_name
+                 FROM advance_balance ab
+                 LEFT JOIN depo d ON ab.DepoID = d.id
+                 WHERE ab.TripID = ? 
+                   AND ab.Active = 1`,
+                [id]
+            );
+            
+            console.log(`Found ${advanceRows.length} advance_balance record(s) for trip ${id}`);
+            
+            if (advanceRows.length > 0) {
+                // Group by DepoID to track affected depos
+                const depoIds = [...new Set(advanceRows.map(r => r.DepoID))];
+                
+                // Soft delete all advance_balance rows for this trip
+                const [softDeleteResult] = await connection.execute(
+                    `UPDATE advance_balance SET Active = 0, MD = NOW() WHERE TripID = ? AND Active = 1`,
+                    [id]
+                );
+                console.log(`Soft deleted ${softDeleteResult.affectedRows} advance_balance record(s) for trip ${id}`);
+                
+                // Recalculate balances for each affected depo
+                for (const depoId of depoIds) {
+                    const depoRows = advanceRows.filter(r => r.DepoID === depoId);
+                    const depoName = depoRows[0]?.depo_name || `Depo ${depoId}`;
+                    const totalDebit = depoRows.reduce((sum, r) => sum + (parseFloat(r.Debit) || 0), 0);
+                    const totalCredit = depoRows.reduce((sum, r) => sum + (parseFloat(r.Credit) || 0), 0);
+                    
+                    // Get balance before recalculation
+                    const [beforeRows] = await connection.execute(
+                        `SELECT Balance FROM advance_balance 
+                         WHERE DepoID = ? AND Active = 1 
+                         ORDER BY ID DESC LIMIT 1`,
+                        [depoId]
+                    );
+                    const balanceBefore = beforeRows.length > 0 ? parseFloat(beforeRows[0].Balance || 0) : 0;
+                    
+                    // Recalculate balances for this depo
+                    const finalBalance = await recalculateAdvanceBalances(connection, depoId);
+                    
+                    console.log(`✅ Recalculated advance_balance for ${depoName} (ID: ${depoId}): Final Balance=${finalBalance}`);
+                    
+                    // Track for summary
+                    advanceDeletionSummary.push({
+                        depoName,
+                        depoId,
+                        deletedDebit: totalDebit,
+                        deletedCredit: totalCredit,
+                        balanceBefore,
+                        balanceAfter: finalBalance
+                    });
+                }
+            } else {
+                console.log(`No advance_balance records found for trip ${id}`);
+            }
+        } catch (err) {
+            console.error('Error soft deleting advance_balance:', err);
+            console.error('Error stack:', err.stack);
+            // Don't throw - continue with trip deletion even if advance deletion fails
+        }
 
         // Step 1: Soft delete trips table - set active=0
         await connection.execute(
@@ -1763,13 +1976,156 @@ exports.deleteTrip = async (req, res) => {
 
         // Step 8: Soft delete recoveries associated with this trip
         try {
+            // First, get recovery IDs before soft deleting them
+            const [recoveryRows] = await connection.execute(
+                'SELECT ID FROM recoveries WHERE trip_id = ? AND Active = 1',
+                [id]
+            );
+            const recoveryIds = recoveryRows.map(r => r.ID);
+            
+            // Soft delete recoveries
             const [recoveriesResult] = await connection.execute(
                 'UPDATE recoveries SET Active = 0, MD = NOW() WHERE trip_id = ? AND Active = 1',
                 [id]
             );
             console.log(`Soft deleted ${recoveriesResult.affectedRows} recovery record(s) for trip_id ${id}`);
+            
+            // Step 8.0: Soft delete settlements for these recoveries
+            if (recoveryIds.length > 0) {
+                try {
+                    const placeholders = recoveryIds.map(() => '?').join(',');
+                    const [settlementsResult] = await connection.execute(
+                        `UPDATE settlements SET Active = 0, MD = NOW() WHERE recovery_id IN (${placeholders}) AND Active = 1`,
+                        recoveryIds
+                    );
+                    console.log(`Soft deleted ${settlementsResult.affectedRows} settlement record(s) for recovery_ids: ${recoveryIds.join(', ')}`);
+                } catch (err) {
+                    console.log('Error soft deleting settlements:', err.message);
+                    console.error('Error stack:', err.stack);
+                }
+            }
+            
+            // Step 8.0.5: Soft delete advance_balance entries linked via recovery_id
+            if (recoveryIds.length > 0) {
+                try {
+                    console.log(`Starting advance_balance soft delete for recovery_ids: ${recoveryIds.join(', ')}`);
+                    
+                    // Get all advance_balance records for these recoveries
+                    const placeholders = recoveryIds.map(() => '?').join(',');
+                    const [advanceRecoveryRows] = await connection.execute(
+                        `SELECT ab.ID, ab.DepoID, ab.Debit, ab.Credit, d.name as depo_name
+                         FROM advance_balance ab
+                         LEFT JOIN depo d ON ab.DepoID = d.id
+                         WHERE ab.recovery_id IN (${placeholders})
+                           AND ab.Active = 1`,
+                        recoveryIds
+                    );
+                    
+                    console.log(`Found ${advanceRecoveryRows.length} advance_balance record(s) for recovery_ids: ${recoveryIds.join(', ')}`);
+                    
+                    if (advanceRecoveryRows.length > 0) {
+                        // Group by DepoID to track affected depos
+                        const depoIds = [...new Set(advanceRecoveryRows.map(r => r.DepoID))];
+                        
+                        // Soft delete all advance_balance rows for these recoveries
+                        const [advanceRecoveryDeleteResult] = await connection.execute(
+                            `UPDATE advance_balance SET Active = 0, MD = NOW() WHERE recovery_id IN (${placeholders}) AND Active = 1`,
+                            recoveryIds
+                        );
+                        console.log(`Soft deleted ${advanceRecoveryDeleteResult.affectedRows} advance_balance record(s) for recovery_ids: ${recoveryIds.join(', ')}`);
+                        
+                        // Recalculate balances for each affected depo
+                        for (const depoId of depoIds) {
+                            const depoRows = advanceRecoveryRows.filter(r => r.DepoID === depoId);
+                            const depoName = depoRows[0]?.depo_name || `Depo ${depoId}`;
+                            const totalDebit = depoRows.reduce((sum, r) => sum + (parseFloat(r.Debit) || 0), 0);
+                            const totalCredit = depoRows.reduce((sum, r) => sum + (parseFloat(r.Credit) || 0), 0);
+                            
+                            // Get balance before recalculation
+                            const [beforeRows] = await connection.execute(
+                                `SELECT Balance FROM advance_balance 
+                                 WHERE DepoID = ? AND Active = 1 
+                                 ORDER BY ID DESC LIMIT 1`,
+                                [depoId]
+                            );
+                            const balanceBefore = beforeRows.length > 0 ? parseFloat(beforeRows[0].Balance || 0) : 0;
+                            
+                            // Recalculate balances for this depo
+                            const finalBalance = await recalculateAdvanceBalances(connection, depoId);
+                            
+                            console.log(`✅ Recalculated advance_balance for ${depoName} (ID: ${depoId}) after recovery deletion: Final Balance=${finalBalance}`);
+                            
+                            // Track for summary
+                            advanceDeletionSummary.push({
+                                depoName,
+                                depoId,
+                                deletedDebit: totalDebit,
+                                deletedCredit: totalCredit,
+                                balanceBefore,
+                                balanceAfter: finalBalance,
+                                source: 'recovery'
+                            });
+                        }
+                    } else {
+                        console.log(`No advance_balance records found for recovery_ids: ${recoveryIds.join(', ')}`);
+                    }
+                } catch (err) {
+                    console.error('Error soft deleting advance_balance for recoveries:', err);
+                    console.error('Error stack:', err.stack);
+                    // Don't throw - continue with trip deletion even if advance deletion fails
+                }
+            }
+            
+            // Step 8.1: Soft delete pool entries for these recoveries
+            if (recoveryIds.length > 0) {
+                for (const recoveryId of recoveryIds) {
+                    // Get pool rows for this recovery_id (TripID might be null or set)
+                    const [poolRecoveryRows] = await connection.execute(
+                        'SELECT ID, DepoID, Credit FROM pool WHERE recovery_id = ? AND active = 1',
+                        [recoveryId]
+                    );
+                    
+                    if (poolRecoveryRows.length > 0) {
+                        const minPoolId = Math.min(...poolRecoveryRows.map(r => r.ID));
+                        const poolDepoIds = [...new Set(poolRecoveryRows.map(r => r.DepoID))];
+                        const totalCredits = poolRecoveryRows.reduce((sum, r) => sum + (parseFloat(r.Credit) || 0), 0);
+                        
+                        // Soft delete these pool rows
+                        const [poolRecoveryDeleteResult] = await connection.execute(
+                            'UPDATE pool SET active = 0, MD = NOW() WHERE recovery_id = ? AND active = 1',
+                            [recoveryId]
+                        );
+                        console.log(`Soft deleted ${poolRecoveryDeleteResult.affectedRows} pool record(s) for recovery_id ${recoveryId}`);
+                        
+                        // Recalculate balances for each affected depo
+                        for (const poolDepoId of poolDepoIds) {
+                            const finalBalance = await recalculatePoolBalancesFromRow(connection, poolDepoId, minPoolId);
+                            if (finalBalance !== null) {
+                                // Subtract total credits from depo balance (recovery credits increase depo limit)
+                                await connection.execute(
+                                    'UPDATE depo SET Balance = Balance - ?, MD = NOW() WHERE id = ?',
+                                    [totalCredits, poolDepoId]
+                                );
+                                console.log(`Updated depo ${poolDepoId} balance: subtracted ${totalCredits} credits from recovery ${recoveryId}`);
+                            }
+                        }
+                    }
+                }
+            }
         } catch (err) {
-            console.log('Error soft deleting recoveries:', err.message);
+            console.log('Error soft deleting recoveries and their pool entries:', err.message);
+            console.error('Error stack:', err.stack);
+        }
+
+        // Step 8.5: Soft delete vehicle_rents associated with this trip
+        try {
+            const [vehicleRentsResult] = await connection.execute(
+                'UPDATE vehicle_rent SET Active = 0, MD = NOW() WHERE trip_id = ? AND Active = 1',
+                [id]
+            );
+            console.log(`Soft deleted ${vehicleRentsResult.affectedRows} vehicle_rent record(s) for trip_id ${id}`);
+        } catch (err) {
+            console.log('Error soft deleting vehicle_rents:', err.message);
         }
 
         // Step 9: Reverse transactions in cash_in_hand and accounts tables
@@ -1972,8 +2328,18 @@ exports.deleteTrip = async (req, res) => {
         console.log(`  - pol_sale: soft deleted`);
         console.log(`  - trip_depos: soft deleted`);
         console.log(`  - pool: soft deleted and balances recalculated`);
+        
+        // Show advance balance deletion details
+        if (advanceDeletionSummary.length > 0) {
+            console.log(`  - advance_balance: soft deleted and balances recalculated`);
+            advanceDeletionSummary.forEach(del => {
+                console.log(`    • ${del.depoName} (ID: ${del.depoId}): Balance ${del.balanceBefore} → ${del.balanceAfter} (Deleted: Debit=${del.deletedDebit}, Credit=${del.deletedCredit})`);
+            });
+        }
+        
         console.log(`  - payments: soft deleted`);
         console.log(`  - recoveries: soft deleted`);
+        console.log(`  - vehicle_rents: soft deleted`);
         console.log(`  - transactions: soft deleted`);
         console.log(`  - cash_in_hand: soft deleted and balances recalculated`);
         console.log(`  - accounts: soft deleted and balances adjusted`);
@@ -2021,41 +2387,79 @@ exports.getDepoRemainingAmount = async (req, res) => {
             return res.status(400).json({ message: 'Depo ID is required' });
         }
 
-        // Calculate remaining amount from pool table (same logic as dashboard):
-        // Remaining = Initial Limit - Current Limit (which is the used amount)
-        // This shows how much credit has been used from the depo, matching the dashboard "USED" column
-        const query = `
-            SELECT 
-                COALESCE((SELECT p.DepoLimit 
-                          FROM pool p 
-                          WHERE p.DepoID = ? 
-                            AND p.TripID IS NULL 
-                            AND p.recovery_id IS NULL 
-                            AND p.payment_id IS NULL 
-                            AND p.active = 1 
-                          ORDER BY p.ID ASC 
-                          LIMIT 1), 
-                         (SELECT d.Balance FROM depo d WHERE d.id = ? AND d.active = 1), 0) as InitialLimit,
-                COALESCE((SELECT p.DepoLimit 
-                          FROM pool p 
-                          WHERE p.DepoID = ? 
-                            AND p.active = 1 
-                          ORDER BY p.ID DESC 
-                          LIMIT 1), 
-                         (SELECT d.Balance FROM depo d WHERE d.id = ? AND d.active = 1), 0) as CurrentLimit
-        `;
+        // Get depo info (Balance comes from depo table; advance comes from advance_balance table)
+        const [depoRows] = await db.execute(
+            `SELECT Balance FROM depo WHERE id = ? AND active = 1`,
+            [depoId]
+        );
         
-        const [rows] = await db.execute(query, [depoId, depoId, depoId, depoId]);
-        const initialLimit = parseFloat(rows[0]?.InitialLimit || 0);
-        const currentLimit = parseFloat(rows[0]?.CurrentLimit || 0);
+        if (depoRows.length === 0) {
+            return res.status(404).json({ message: 'Depo not found' });
+        }
         
-        // Remaining amount = Initial Limit - Current Limit (amount used/owed)
-        // This matches the "USED" calculation in the dashboard
-        const remainingAmount = initialLimit - currentLimit;
+        const depoBalance = parseFloat(depoRows[0].Balance || 0);
         
-        console.log(`Depo ${depoId}: InitialLimit=${initialLimit}, CurrentLimit=${currentLimit}, RemainingAmount=${remainingAmount}`);
+        // Advance balance is stored in advance_balance table (latest Balance)
+        const [advanceRows] = await db.execute(
+            `SELECT COALESCE(Balance, 0) as advance_balance
+             FROM advance_balance
+             WHERE DepoID = ? AND Active = 1
+             ORDER BY ID DESC
+             LIMIT 1`,
+            [depoId]
+        );
+        const advanceBalance = parseFloat(advanceRows[0]?.advance_balance || 0);
         
-        res.json({ remainingAmount: remainingAmount });
+        // Get the latest pool DepoLimit (this is the authoritative source for credit limit)
+        // Pool table is updated when recoveries/payments are added, so it's always current
+        const [latestPoolRows] = await db.execute(
+            `SELECT DepoLimit, ID
+             FROM pool
+             WHERE DepoID = ? AND active = 1
+             ORDER BY ID DESC
+             LIMIT 1`,
+            [depoId]
+        );
+        
+        // Use pool DepoLimit as source of truth, fallback to depo.Balance if no pool entries exist
+        const currentPoolLimit = latestPoolRows.length > 0
+            ? parseFloat(latestPoolRows[0].DepoLimit || 0)
+            : depoBalance;
+        
+        // Log for debugging if there's a mismatch between pool and depo table
+        if (latestPoolRows.length > 0) {
+            const poolDepoLimit = parseFloat(latestPoolRows[0].DepoLimit || 0);
+            if (Math.abs(depoBalance - poolDepoLimit) > 0.01) {
+                console.log(`Warning: depo.Balance (${depoBalance}) != pool DepoLimit (${poolDepoLimit}) for depo ${depoId}. Using pool DepoLimit.`);
+            }
+        }
+        
+        // Calculate remaining amount from trip_depos (amount owed from trips)
+        const [remainingBalanceRows] = await db.execute(
+            `SELECT COALESCE(SUM(payable_amount - COALESCE(paid_amount, 0)), 0) as remaining_balance
+             FROM trip_depos
+             WHERE depo_id = ? 
+               AND Active = 1
+               AND (payable_amount - COALESCE(paid_amount, 0)) > 0`,
+            [depoId]
+        );
+        
+        const remainingAmount = parseFloat(remainingBalanceRows[0]?.remaining_balance || 0);
+        
+        // Total available funds for new product purchases:
+        // - credit side: currentPoolLimit
+        // - advance side: advanceBalance
+        const totalAvailable = advanceBalance + currentPoolLimit;
+        
+        console.log(`Depo ${depoId}: RemainingAmount=${remainingAmount}, AdvanceBalance=${advanceBalance}, CreditBalance=${currentPoolLimit}, TotalAvailable=${totalAvailable}`);
+        
+        res.json({ 
+            remainingAmount: remainingAmount,
+            advanceBalance: advanceBalance,
+            // IMPORTANT: This is the "current credit limit" (latest pool DepoLimit), matching Pool History UI
+            creditBalance: currentPoolLimit,
+            totalAvailable: totalAvailable
+        });
     } catch (err) {
         console.error('Error fetching depo remaining amount:', err);
         res.status(500).json({ 
@@ -2812,9 +3216,15 @@ exports.getTripDistribution = async (req, res) => {
                 ps.total_amount,
                 ps.date,
                 ps.container_type,
-                c.name as client_name
+                c.name as client_name,
+                td.depo_id,
+                d.name as depo_name
             FROM pol_sale ps
             LEFT JOIN customers c ON ps.client_id = c.id AND c.active = 1
+            LEFT JOIN trip_depos td ON ps.trip_id = td.trip_id 
+                AND ps.trip_product_id = td.product_id 
+                AND td.Active = 1
+            LEFT JOIN depo d ON td.depo_id = d.id AND d.active = 1
             WHERE ps.trip_id = ? AND ps.Active = 1
             ORDER BY ps.date DESC, ps.id DESC
         `;

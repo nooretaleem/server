@@ -64,12 +64,14 @@ exports.getPoolHistory = async (req, res) => {
             return res.status(400).json({ message: 'Depo ID is required' });
         }
 
-        const query = `
+        // Get pool entries
+        const poolQuery = `
             SELECT 
                 p.ID,
                 p.DepoID,
                 p.Debit,
                 p.Credit,
+                0 as AdvancePayment,
                 p.DepoLimit,
                 p.active,
                 p.TripID,
@@ -79,7 +81,11 @@ exports.getPoolHistory = async (req, res) => {
                 t.trip_no,
                 pay.id as payment_display_id,
                 r.id as recovery_display_id,
-                c.name as customer_name
+                c.name as customer_name,
+                NULL as transaction_id,
+                NULL as transaction_date,
+                p.CD as pool_date,
+                NULL as is_advance_payment
             FROM pool p
             INNER JOIN depo d ON p.DepoID = d.id
             LEFT JOIN trips t ON p.TripID = t.id
@@ -87,17 +93,270 @@ exports.getPoolHistory = async (req, res) => {
             LEFT JOIN recoveries r ON p.recovery_id = r.id
             LEFT JOIN customers c ON r.ClientID = c.id AND c.active = 1
             WHERE p.DepoID = ? AND p.active = 1
-            ORDER BY p.ID ASC
         `;
-        const [rows] = await db.execute(query, [depoId]);
+        const [poolRows] = await db.execute(poolQuery, [depoId]);
+        
+        // Get depo name first
+        const [depoNameRows] = await db.execute('SELECT name FROM depo WHERE id = ? AND active = 1', [depoId]);
+        const depoName = depoNameRows.length > 0 ? depoNameRows[0].name : null;
+        
+        // Get advance payment transactions from advance_balance table
+        let advanceRows = [];
+        if (depoName) {
+            // Get advance payments added (Credit entries from advance_balance table)
+            const advanceAddedQuery = `
+                SELECT 
+                    ab.ID,
+                    ab.DepoID,
+                    0 as Debit,
+                    0 as Credit,
+                    ab.Credit as AdvancePayment,
+                    NULL as DepoLimit,
+                    ab.Active as active,
+                    ab.TripID,
+                    ab.payment_id,
+                    ab.recovery_id,
+                    ? as DepoName,
+                    NULL as trip_no,
+                    ab.payment_id as payment_display_id,
+                    ab.recovery_id as recovery_display_id,
+                    NULL as customer_name,
+                    NULL as transaction_id,
+                    ab.Date as transaction_date,
+                    CASE 
+                        WHEN ab.payment_id IS NOT NULL THEN CONCAT('Advance Payment (Payment #', ab.payment_id, ')')
+                        WHEN ab.recovery_id IS NOT NULL THEN CONCAT('Advance Payment (Recovery #', ab.recovery_id, ')')
+                        ELSE 'Advance Payment'
+                    END as transaction_purpose,
+                    ab.Date as pool_date,
+                    1 as is_advance_payment,
+                    0 as is_advance_usage,
+                    0 as consumed_amount
+                FROM advance_balance ab
+                WHERE ab.DepoID = ?
+                  AND ab.Active = 1
+                  AND ab.Credit > 0
+            `;
+            const [advanceAddedRows] = await db.execute(advanceAddedQuery, [depoName, depoId]);
+            
+            // Get advance payments consumed from trip transactions
+            // Read from advance_balance table Debit entries with TripID
+            const advanceConsumedQuery = `
+                SELECT 
+                    ab.ID as advance_balance_id,
+                    ab.Debit as consumed_amount,
+                    ab.Date as transaction_date,
+                    CONCAT('Advance Payment Used for Trip ', tr.trip_no) as transaction_purpose,
+                    tr.id as trip_id
+                FROM advance_balance ab
+                INNER JOIN trips tr ON ab.TripID = tr.id AND tr.Active = 1
+                WHERE ab.DepoID = ?
+                  AND ab.Active = 1
+                  AND ab.Debit > 0
+                  AND ab.TripID IS NOT NULL
+                ORDER BY ab.Date ASC, ab.ID ASC
+            `;
+            const [advanceConsumedRows] = await db.execute(advanceConsumedQuery, [depoId]);
+            
+            // Calculate consumed amounts for each advance payment transaction using FIFO
+            // Sort advance payments by date (oldest first) and consumed transactions by date (oldest first)
+            const sortedAdvancePayments = [...advanceAddedRows].sort((a, b) => {
+                const dateA = new Date(a.transaction_date || 0);
+                const dateB = new Date(b.transaction_date || 0);
+                return dateA - dateB;
+            });
+            
+            const sortedConsumedTransactions = [...advanceConsumedRows].sort((a, b) => {
+                const dateA = new Date(a.transaction_date || 0);
+                const dateB = new Date(b.transaction_date || 0);
+                return dateA - dateB;
+            });
+            
+            // Track remaining amounts for each advance payment and consumed transaction
+            const advancePaymentRemaining = sortedAdvancePayments.map(ap => ({
+                ...ap,
+                remaining: parseFloat(ap.AdvancePayment || 0),
+                consumed: 0
+            }));
+            
+            const consumedTransactionRemaining = sortedConsumedTransactions.map(ct => ({
+                ...ct,
+                remaining: parseFloat(ct.consumed_amount || 0)
+            }));
+            
+            // Allocate consumed transactions to advance payments using FIFO
+            for (const consumed of consumedTransactionRemaining) {
+                let remainingToAllocate = consumed.remaining;
+                
+                for (const advancePayment of advancePaymentRemaining) {
+                    if (remainingToAllocate <= 0) break;
+                    if (advancePayment.remaining <= 0) continue;
+                    
+                    // Check if consumed transaction date is after or equal to advance payment date
+                    const advanceDate = new Date(advancePayment.transaction_date || 0);
+                    const consumedDate = new Date(consumed.transaction_date || 0);
+                    if (consumedDate < advanceDate) continue;
+                    
+                    // Allocate as much as possible
+                    const allocation = Math.min(remainingToAllocate, advancePayment.remaining);
+                    advancePayment.consumed += allocation;
+                    advancePayment.remaining -= allocation;
+                    remainingToAllocate -= allocation;
+                }
+            }
+            
+            // Update advanceAddedRows with consumed amounts from FIFO allocation
+            console.log('FIFO Allocation Results:');
+            console.log('Payment rows:', advancePaymentRemaining.map(ap => ({
+                transaction_id: ap.transaction_id,
+                date: ap.transaction_date,
+                amount: ap.AdvancePayment,
+                consumed: ap.consumed,
+                remaining: ap.remaining
+            })));
+            
+            advanceAddedRows.forEach((row, index) => {
+                // Find the matching payment in the FIFO allocation results
+                // Match by index since both arrays are sorted by date
+                const matchingPayment = advancePaymentRemaining[index];
+                
+                if (matchingPayment && matchingPayment.consumed > 0) {
+                    advanceAddedRows[index].consumed_amount = matchingPayment.consumed;
+                    console.log(`Payment ${index + 1}: Payment=${matchingPayment.AdvancePayment}, Consumed=${matchingPayment.consumed}, Remaining=${matchingPayment.remaining}`);
+                } else {
+                    advanceAddedRows[index].consumed_amount = null; // Show blank if not consumed yet
+                    console.log(`Payment ${index + 1}: Not consumed yet`);
+                }
+            });
+            
+            // Get advance payments used (from trips table)
+            // Read advance_balance directly from trip_depos table for this specific depo
+            // IMPORTANT: Only show if this specific depo actually used advance balance (advance_balance > 0)
+            // Include both 'credit' and 'advance' purchase types
+            const advanceUsedQuery = `
+                SELECT 
+                    NULL as ID,
+                    ? as DepoID,
+                    0 as Debit,
+                    0 as Credit,
+                    ab.Debit as AdvancePayment,
+                    NULL as DepoLimit,
+                    1 as active,
+                    tr.id as TripID,
+                    NULL as payment_id,
+                    NULL as recovery_id,
+                    ? as DepoName,
+                    tr.trip_no,
+                    NULL as payment_display_id,
+                    NULL as recovery_display_id,
+                    NULL as customer_name,
+                    NULL as transaction_id,
+                    tr.start_date as transaction_date,
+                    CONCAT('Advance Payment Used for Trip ', tr.trip_no) as transaction_purpose,
+                    NULL as pool_date,
+                    1 as is_advance_payment,
+                    1 as is_advance_usage,
+                    ab.Debit as consumed_amount
+                FROM advance_balance ab
+                INNER JOIN trips tr ON ab.TripID = tr.id
+                WHERE ab.DepoID = ?
+                  AND ab.Active = 1
+                  AND tr.Active = 1
+                  AND ab.Debit > 0
+                  AND ab.TripID IS NOT NULL
+            `;
+            const [advanceUsedRows] = await db.execute(advanceUsedQuery, [depoId, depoName, depoId]);
+            
+            // Filter out rows where AdvancePayment is 0 or null, and convert to number
+            const validAdvanceUsedRows = advanceUsedRows
+                .filter(row => row.AdvancePayment > 0)
+                .map(row => ({
+                    ...row,
+                    AdvancePayment: parseFloat(row.AdvancePayment) || 0,
+                    consumed_amount: parseFloat(row.consumed_amount) || 0
+                }));
+            
+            // NOTE: Old "Advance Payment - TRIP-#" transactions from transactions table are NOT included
+            // We now read advance usage directly from trip_depos.advance_balance
+            // This prevents duplicate entries for consumed advance
+            
+            // Combine additions and usages only (no old trip transactions)
+            advanceRows = [...advanceAddedRows, ...validAdvanceUsedRows];
+            
+            // Sort by date
+            advanceRows.sort((a, b) => {
+                const dateA = a.transaction_date ? new Date(a.transaction_date) : new Date(0);
+                const dateB = b.transaction_date ? new Date(b.transaction_date) : new Date(0);
+                if (dateA.getTime() !== dateB.getTime()) {
+                    return dateA.getTime() - dateB.getTime();
+                }
+                return (a.transaction_id || a.TripID || 0) - (b.transaction_id || b.TripID || 0);
+            });
+        }
+        
+        // Combine pool entries and advance payments
+        let allRows = [...poolRows, ...advanceRows];
+        
+        // Sort chronologically: by date (CD for pool entries, Date for transactions), then by ID
+        allRows.sort((a, b) => {
+            let dateA, dateB;
+            
+            if (a.is_advance_payment) {
+                dateA = a.transaction_date ? new Date(a.transaction_date) : new Date(0);
+            } else {
+                // For pool entries, use CD (creation date)
+                dateA = a.pool_date ? new Date(a.pool_date) : new Date(0);
+            }
+            
+            if (b.is_advance_payment) {
+                dateB = b.transaction_date ? new Date(b.transaction_date) : new Date(0);
+            } else {
+                // For pool entries, use CD (creation date)
+                dateB = b.pool_date ? new Date(b.pool_date) : new Date(0);
+            }
+            
+            // If both have dates, sort by date
+            if (dateA.getTime() !== dateB.getTime() && dateA.getTime() !== 0 && dateB.getTime() !== 0) {
+                return dateA.getTime() - dateB.getTime();
+            }
+            
+            // If one has date and other doesn't, prioritize the one with date
+            if (dateA.getTime() !== 0 && dateB.getTime() === 0) return -1;
+            if (dateA.getTime() === 0 && dateB.getTime() !== 0) return 1;
+            
+            // Both are pool entries or both are advance payments, sort by ID/transaction_id
+            if (a.is_advance_payment && b.is_advance_payment) {
+                return (a.transaction_id || 0) - (b.transaction_id || 0);
+            } else if (!a.is_advance_payment && !b.is_advance_payment) {
+                return a.ID - b.ID;
+            } else {
+                // Mixed: use date if available, otherwise use ID
+                return (a.transaction_id || a.ID || 0) - (b.transaction_id || b.ID || 0);
+            }
+        });
+        
+        // Calculate DepoLimit for advance payments (they don't affect credit limit, so use previous pool entry's limit)
+        let currentDepoLimit = null;
+        for (let i = 0; i < allRows.length; i++) {
+            if (allRows[i].is_advance_payment) {
+                // For advance payments, use the current depo limit (doesn't change)
+                allRows[i].DepoLimit = currentDepoLimit;
+            } else {
+                // For pool entries, update current depo limit
+                currentDepoLimit = allRows[i].DepoLimit;
+            }
+        }
         
         // Build reason for each row
-        // Priority: recovery_id > payment_id > TripID > initial balance
-        const rowsWithReason = rows.map(row => {
+        const rowsWithReason = allRows.map(row => {
             let reason = '';
             
+            // Check if it's an advance payment
+            if (row.is_advance_payment) {
+                reason = row.transaction_purpose || `Advance Payment Added`;
+            }
             // Priority 1: Recovery (direct payment from customer)
-            if (row.recovery_id && row.recovery_display_id) {
+            else if (row.recovery_id && row.recovery_display_id) {
                 if (row.customer_name) {
                     reason = `Direct payment from customer "${row.customer_name}" (Recovery ID: ${row.recovery_display_id})`;
                 } else {

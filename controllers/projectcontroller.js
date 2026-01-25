@@ -532,7 +532,34 @@ exports.getDashboardData = async (req, res) => {
                 // Used = Initial Limit - Available
                 const used = Math.max(0, initialLimit - available);
                 
-                console.log(`Depo ${row.DepoID} (${row.DepoName}): InitialLimit=${initialLimit}, TotalCredit=${totalCredit}, TotalDebit=${totalDebit}, CurrentLimit=${currentLimit}, Limit=${limit}, Used=${used}, Available=${available}`);
+                // Get advance balance from advance_balance table (latest Balance)
+                const [advanceRows] = await db.execute(`
+                    SELECT COALESCE(Balance, 0) as advance_balance
+                    FROM advance_balance
+                    WHERE DepoID = ? AND Active = 1
+                    ORDER BY ID DESC
+                    LIMIT 1
+                `, [row.DepoID]);
+                
+                const advanceBalance = parseFloat(advanceRows[0]?.advance_balance || 0);
+                
+                // Calculate used advance balance from advance_balance table (Debit entries with TripID)
+                // Sum all Debit entries in advance_balance table for active trips for this depo
+                const [usedAdvanceRows] = await db.execute(`
+                    SELECT COALESCE(SUM(ab.Debit), 0) as total_used_advance
+                    FROM advance_balance ab
+                    INNER JOIN trips tr ON ab.TripID = tr.id
+                    WHERE ab.DepoID = ?
+                      AND ab.Active = 1
+                      AND tr.Active = 1
+                      AND ab.Debit > 0
+                      AND ab.TripID IS NOT NULL
+                `, [row.DepoID]);
+                
+                const usedAdvanceBalance = parseFloat(usedAdvanceRows[0]?.total_used_advance || 0);
+                const availableAdvanceBalance = Math.max(0, advanceBalance - usedAdvanceBalance);
+                
+                console.log(`Depo ${row.DepoID} (${row.DepoName}): InitialLimit=${initialLimit}, TotalCredit=${totalCredit}, TotalDebit=${totalDebit}, CurrentLimit=${currentLimit}, Limit=${limit}, Used=${used}, Available=${available}, AdvanceBalance=${advanceBalance}, UsedAdvance=${usedAdvanceBalance}, AvailableAdvance=${availableAdvanceBalance}`);
                 
                 return {
                     depo: row.DepoName || `Depo ${row.DepoID}`,
@@ -540,7 +567,10 @@ exports.getDashboardData = async (req, res) => {
                     company_name: row.CompanyName || null,
                     limit: limit,
                     used: used,
-                    available: available
+                    available: available,
+                    advance_balance: advanceBalance,
+                    used_advance_balance: usedAdvanceBalance,
+                    available_advance_balance: availableAdvanceBalance
                 };
             }));
         } catch (err) {
@@ -656,20 +686,22 @@ exports.getDashboardData = async (req, res) => {
             totalRentPaidToday = 0;
         }
 
-        // 8. Get Total Payment to Depos Today (from transactions table, only active payments)
-        // Include both Debit (cash in hand payments) and Credit (account payments) as both are payments to depo
+        // 8. Get Total Payment to Depos Today (from payments table)
+        // Sum the Amount from payments table - includes both regular and advance payments to dealers
         let totalPaymentToDeposToday = 0;
         try {
             const [paymentToDeposRows] = await db.execute(`
-                SELECT COALESCE(SUM(t.Debit + t.Credit), 0) as total
-                FROM transactions t
-                INNER JOIN payments p ON t.ID = p.transactionID
-                WHERE (t.Purpose LIKE 'Payment to %' OR t.Purpose LIKE 'Payment for %')
+                SELECT COALESCE(SUM(p.Amount), 0) as total
+                FROM payments p
+                INNER JOIN transactions t ON t.ID = p.transactionID
+                WHERE (t.Purpose LIKE '%Payment to %' OR t.Purpose LIKE 'Payment for %')
                   AND DATE(t.Date) = CURDATE()
                   AND t.active = 1
                   AND p.active = 1
+                  AND p.DepoID IS NOT NULL
             `);
             totalPaymentToDeposToday = parseFloat(paymentToDeposRows[0]?.total || 0);
+            console.log('Total Payment to Depos Today:', totalPaymentToDeposToday);
         } catch (err) {
             console.error('Error fetching total payment to depos today:', err);
             totalPaymentToDeposToday = 0;

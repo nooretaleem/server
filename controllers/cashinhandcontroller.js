@@ -3,12 +3,13 @@ const db = require('../models/db');
 // Helper function to recalculate all balances in cash_in_hand table
 async function recalculateAllBalances(connection) {
     try {
-        // Get all active records ordered by created_at and id
+        // Get all active records ordered by id ASC (IDs are sequential and represent insertion order)
+        // This ensures correct balance calculation regardless of created_at timestamp issues
         const [allRecords] = await connection.execute(`
             SELECT id, debit, credit
             FROM cash_in_hand
             WHERE Active = 1
-            ORDER BY created_at ASC, id ASC
+            ORDER BY id ASC
         `);
         
         let runningBalance = 0;
@@ -111,6 +112,7 @@ exports.getCashAccounts = async (req, res) => {
 exports.getCashInHandBalance = async (req, res) => {
     try {
         // Calculate balance from sum of all active records (same as dashboard calculation)
+        // This ensures consistency with dashboard regardless of stored balance values
         const query = `
             SELECT COALESCE(SUM(COALESCE(credit, 0) - COALESCE(debit, 0)), 0) as balance
             FROM cash_in_hand
@@ -119,6 +121,22 @@ exports.getCashInHandBalance = async (req, res) => {
         
         const [rows] = await db.execute(query);
         const balance = parseFloat(rows[0]?.balance || 0);
+        
+        // Also get the latest balance from the table for verification
+        const [latestRows] = await db.execute(`
+            SELECT balance
+            FROM cash_in_hand
+            WHERE Active = 1
+            ORDER BY id DESC
+            LIMIT 1
+        `);
+        
+        const latestStoredBalance = latestRows.length > 0 ? parseFloat(latestRows[0]?.balance || 0) : 0;
+        
+        // Log if there's a mismatch (indicates balances need recalculation)
+        if (Math.abs(balance - latestStoredBalance) > 0.01) {
+            console.log(`Warning: Cash in Hand balance mismatch - SUM calculation: ${balance}, Latest stored balance: ${latestStoredBalance}. Balances may need recalculation.`);
+        }
         
         res.json({
             balance: Number(balance)
@@ -190,7 +208,7 @@ exports.getCashInHandHistoryByDate = async (req, res) => {
         // Use DATE_FORMAT to match dates properly and avoid timezone issues
         // Simply select all columns including balance from the table
         // Only show active records (Active = 1)
-        // Order by created_at ASC (chronological order - oldest first) and id ASC as tiebreaker
+        // Order by id ASC to ensure correct sequence (IDs are sequential and represent insertion order)
         const query = `
             SELECT 
                 id,
@@ -202,7 +220,7 @@ exports.getCashInHandHistoryByDate = async (req, res) => {
                     FROM cash_in_hand
             WHERE DATE_FORMAT(created_at, '%Y-%m-%d') = ?
             AND Active = 1
-            ORDER BY created_at ASC, id ASC
+            ORDER BY id ASC
         `;
         
         const [rows] = await db.execute(query, [formattedDate]);

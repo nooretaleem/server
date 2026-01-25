@@ -184,7 +184,7 @@ exports.addVehicleRent = async (req, res) => {
 
         // 3. Create transaction based on payment source
         if (payment_source === 'cash') {
-            // Cash payment - credit cash in hand
+            // Cash payment - debit cash in hand (money going out)
             // Get current cash in hand balance from last active entry
             const [balanceRows] = await connection.execute(`
                 SELECT balance 
@@ -194,23 +194,23 @@ exports.addVehicleRent = async (req, res) => {
                 LIMIT 1
             `);
             const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
-            const newBalance = currentBalance - total_rent; // Credit subtracts from balance
+            const newBalance = currentBalance - total_rent; // Debit subtracts from balance
 
-            // Insert into cash_in_hand
+            // Insert into cash_in_hand (debit entry - money going out)
             const [cashInHandResult] = await connection.execute(`
-                INSERT INTO cash_in_hand (credit, balance, purpose, created_at, active)
-                VALUES (?, ?, ?, NOW(), 1)
+                INSERT INTO cash_in_hand (debit, credit, balance, purpose, created_at, active)
+                VALUES (?, 0, ?, ?, NOW(), 1)
             `, [total_rent, newBalance, purpose]);
 
             const cashInHandId = cashInHandResult.insertId;
 
-            // Insert into transactions
+            // Insert into transactions (debit entry - money going out)
             const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     cash_in_hand_id, AccountID, Purpose, Debit, Credit, 
-                    PaymentMode, Date, CD, MD, active
-                ) VALUES (?, NULL, ?, 0, ?, 'Cash', NOW(), NOW(), NOW(), 1)
-            `, [cashInHandId, purpose, total_rent]);
+                    PaymentMode, Date, trip_id, CD, MD, active
+                ) VALUES (?, NULL, ?, ?, 0, 'Cash', NOW(), ?, NOW(), NOW(), 1)
+            `, [cashInHandId, purpose, total_rent, trip_id]);
 
             // Update vehicle_rent with transactionID
             await connection.execute(`
@@ -218,7 +218,7 @@ exports.addVehicleRent = async (req, res) => {
             `, [transactionResult.insertId, vehicleRentId]);
 
         } else if (payment_source === 'bank') {
-            // Bank payment - credit account
+            // Bank payment - debit account (money going out)
             if (!account_id) {
                 await connection.rollback();
                 connection.release();
@@ -237,20 +237,20 @@ exports.addVehicleRent = async (req, res) => {
                 return res.status(404).json({ message: 'Account not found or inactive' });
             }
 
-            // Update account balance (credit subtracts from balance)
+            // Update account balance (debit subtracts from balance)
             await connection.execute(`
                 UPDATE accounts 
                 SET Balance = Balance - ?, MD = NOW()
                 WHERE ID = ? AND active = 1
             `, [total_rent, account_id]);
 
-            // Insert into transactions
+            // Insert into transactions (debit entry - money going out)
             const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     AccountID, cash_in_hand_id, Purpose, Debit, Credit,
-                    PaymentMode, Date, CD, MD, active
-                ) VALUES (?, NULL, ?, 0, ?, 'Bank', NOW(), NOW(), NOW(), 1)
-            `, [account_id, purpose, total_rent]);
+                    PaymentMode, Date, trip_id, CD, MD, active
+                ) VALUES (?, NULL, ?, ?, 0, 'Bank', NOW(), ?, NOW(), NOW(), 1)
+            `, [account_id, purpose, total_rent, trip_id]);
 
             // Update vehicle_rent with transactionID
             await connection.execute(`
@@ -337,7 +337,10 @@ exports.updateVehicleRent = async (req, res) => {
 
         if (oldTransactionRows.length > 0) {
             const oldTransaction = oldTransactionRows[0];
-            const oldAmount = parseFloat(oldTransaction.Credit || 0);
+            // Get the amount from either Debit or Credit (whichever is non-zero)
+            const oldDebit = parseFloat(oldTransaction.Debit || 0);
+            const oldCredit = parseFloat(oldTransaction.Credit || 0);
+            const oldAmount = oldDebit > 0 ? oldDebit : oldCredit;
 
             // Reverse cash in hand transaction
             if (oldTransaction.cash_in_hand_id) {
@@ -350,13 +353,15 @@ exports.updateVehicleRent = async (req, res) => {
                     LIMIT 1
                 `);
                 const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
-                const newBalance = currentBalance + oldAmount; // Reverse credit (add back)
+                // Reverse: if it was a debit, add it back (credit entry)
+                const amountToReverse = oldAmount;
+                const newBalance = currentBalance + amountToReverse; // Reverse debit (add back)
 
-                // Insert reverse entry
+                // Insert reverse entry (credit to reverse the debit)
                 await connection.execute(`
-                    INSERT INTO cash_in_hand (debit, balance, purpose, created_at, active)
-                    VALUES (?, ?, ?, NOW(), 1)
-                `, [oldAmount, newBalance, `Reversal: ${oldPurpose}`]);
+                    INSERT INTO cash_in_hand (debit, credit, balance, purpose, created_at, active)
+                    VALUES (0, ?, ?, ?, NOW(), 1)
+                `, [amountToReverse, newBalance, `Reversal: ${oldPurpose}`]);
 
                 // Mark transaction as inactive
                 await connection.execute(`
@@ -366,12 +371,13 @@ exports.updateVehicleRent = async (req, res) => {
 
             // Reverse bank account transaction
             if (oldTransaction.AccountID) {
-                // Reverse account balance (add back the credit)
+                // Reverse account balance (add back the debit)
+                const amountToReverse = oldAmount;
                 await connection.execute(`
                     UPDATE accounts 
                     SET Balance = Balance + ?, MD = NOW()
                     WHERE ID = ? AND active = 1
-                `, [oldAmount, oldTransaction.AccountID]);
+                `, [amountToReverse, oldTransaction.AccountID]);
 
                 // Mark transaction as inactive
                 await connection.execute(`
@@ -402,7 +408,7 @@ exports.updateVehicleRent = async (req, res) => {
 
         // 6. Create new transaction based on payment source
         if (payment_source === 'cash') {
-            // Cash payment - credit cash in hand
+            // Cash payment - debit cash in hand (money going out)
             // Get current cash in hand balance from last active entry
             const [balanceRows] = await connection.execute(`
                 SELECT balance 
@@ -412,23 +418,23 @@ exports.updateVehicleRent = async (req, res) => {
                 LIMIT 1
             `);
             const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
-            const newBalance = currentBalance - total_rent; // Credit subtracts from balance
+            const newBalance = currentBalance - total_rent; // Debit subtracts from balance
 
-            // Insert into cash_in_hand
+            // Insert into cash_in_hand (debit entry - money going out)
             const [cashInHandResult] = await connection.execute(`
-                INSERT INTO cash_in_hand (credit, balance, purpose, created_at, active)
-                VALUES (?, ?, ?, NOW(), 1)
+                INSERT INTO cash_in_hand (debit, credit, balance, purpose, created_at, active)
+                VALUES (?, 0, ?, ?, NOW(), 1)
             `, [total_rent, newBalance, newPurpose]);
 
             const cashInHandId = cashInHandResult.insertId;
 
-            // Insert into transactions
+            // Insert into transactions (debit entry - money going out)
             const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     cash_in_hand_id, AccountID, Purpose, Debit, Credit, 
-                    PaymentMode, Date, CD, MD, active
-                ) VALUES (?, NULL, ?, 0, ?, 'Cash', NOW(), NOW(), NOW(), 1)
-            `, [cashInHandId, newPurpose, total_rent]);
+                    PaymentMode, Date, trip_id, CD, MD, active
+                ) VALUES (?, NULL, ?, ?, 0, 'Cash', NOW(), ?, NOW(), NOW(), 1)
+            `, [cashInHandId, newPurpose, total_rent, trip_id]);
 
             // Update vehicle_rent with transactionID
             await connection.execute(`
@@ -436,7 +442,7 @@ exports.updateVehicleRent = async (req, res) => {
             `, [transactionResult.insertId, id]);
 
         } else if (payment_source === 'bank') {
-            // Bank payment - credit account
+            // Bank payment - debit account (money going out)
             if (!account_id) {
                 await connection.rollback();
                 connection.release();
@@ -455,20 +461,20 @@ exports.updateVehicleRent = async (req, res) => {
                 return res.status(404).json({ message: 'Account not found or inactive' });
             }
 
-            // Update account balance (credit subtracts from balance)
+            // Update account balance (debit subtracts from balance)
             await connection.execute(`
                 UPDATE accounts 
                 SET Balance = Balance - ?, MD = NOW()
                 WHERE ID = ? AND active = 1
             `, [total_rent, account_id]);
 
-            // Insert into transactions
+            // Insert into transactions (debit entry - money going out)
             const [transactionResult] = await connection.execute(`
                 INSERT INTO transactions (
                     AccountID, cash_in_hand_id, Purpose, Debit, Credit,
-                    PaymentMode, Date, CD, MD, active
-                ) VALUES (?, NULL, ?, 0, ?, 'Bank', NOW(), NOW(), NOW(), 1)
-            `, [account_id, newPurpose, total_rent]);
+                    PaymentMode, Date, trip_id, CD, MD, active
+                ) VALUES (?, NULL, ?, ?, 0, 'Bank', NOW(), ?, NOW(), NOW(), 1)
+            `, [account_id, newPurpose, total_rent, trip_id]);
 
             // Update vehicle_rent with transactionID
             await connection.execute(`
@@ -542,13 +548,17 @@ exports.deleteVehicleRent = async (req, res) => {
                     LIMIT 1
                 `);
                 const currentBalance = balanceRows.length > 0 ? parseFloat(balanceRows[0]?.balance || 0) : 0;
-                const newBalance = currentBalance + amount; // Reverse credit (add back)
+                // Reverse: if it was a debit, add it back (credit entry)
+                const oldDebit = parseFloat(transaction.Debit || 0);
+                const oldCredit = parseFloat(transaction.Credit || 0);
+                const amountToReverse = oldDebit > 0 ? oldDebit : oldCredit;
+                const newBalance = currentBalance + amountToReverse; // Reverse debit (add back)
 
-                // Insert reverse entry
+                // Insert reverse entry (credit to reverse the debit)
                 await connection.execute(`
-                    INSERT INTO cash_in_hand (debit, balance, purpose, created_at, active)
-                    VALUES (?, ?, ?, NOW(), 1)
-                `, [amount, newBalance, `Reversal: ${purpose}`]);
+                    INSERT INTO cash_in_hand (debit, credit, balance, purpose, created_at, active)
+                    VALUES (0, ?, ?, ?, NOW(), 1)
+                `, [amountToReverse, newBalance, `Reversal: ${purpose}`]);
 
                 // Mark transaction as inactive
                 await connection.execute(`
@@ -558,12 +568,15 @@ exports.deleteVehicleRent = async (req, res) => {
 
             // Reverse bank account transaction
             if (transaction.AccountID) {
-                // Reverse account balance (add back the credit)
+                // Reverse account balance (add back the debit)
+                const oldDebit = parseFloat(transaction.Debit || 0);
+                const oldCredit = parseFloat(transaction.Credit || 0);
+                const amountToReverse = oldDebit > 0 ? oldDebit : oldCredit;
                 await connection.execute(`
                     UPDATE accounts 
                     SET Balance = Balance + ?, MD = NOW()
                     WHERE ID = ? AND active = 1
-                `, [amount, transaction.AccountID]);
+                `, [amountToReverse, transaction.AccountID]);
 
                 // Mark transaction as inactive
                 await connection.execute(`

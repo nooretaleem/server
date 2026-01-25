@@ -13,6 +13,13 @@ exports.getDepos = async (req, res) => {
                 d.phone_no,
                 d.address,
                 d.Balance,
+                (
+                    SELECT COALESCE(ab.Balance, 0)
+                    FROM advance_balance ab
+                    WHERE ab.DepoID = d.id AND ab.Active = 1
+                    ORDER BY ab.ID DESC
+                    LIMIT 1
+                ) as advance_balance,
                 d.CD,
                 d.CB,
                 d.MD,
@@ -42,6 +49,13 @@ exports.getDepos = async (req, res) => {
                         phone_no,
                         address,
                         Balance,
+                        (
+                            SELECT COALESCE(ab.Balance, 0)
+                            FROM advance_balance ab
+                            WHERE ab.DepoID = depo.id AND ab.Active = 1
+                            ORDER BY ab.ID DESC
+                            LIMIT 1
+                        ) as advance_balance,
                         CD,
                         CB,
                         MD,

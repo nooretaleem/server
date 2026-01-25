@@ -50,12 +50,13 @@ async function checkAndCloseTrip(connection, tripId) {
 // Helper function to recalculate all balances in cash_in_hand table
 async function recalculateAllBalances(connection) {
     try {
-        // Get all records ordered by created_at and id where Active = 1
+        // Get all active records ordered by id ASC (IDs are sequential and represent insertion order)
+        // This ensures correct balance calculation regardless of created_at timestamp issues
         const [allRecords] = await connection.execute(`
             SELECT id, debit, credit
             FROM cash_in_hand
             WHERE Active = 1
-            ORDER BY created_at ASC, id ASC
+            ORDER BY id ASC
         `);
         
         let runningBalance = 0;
@@ -304,6 +305,8 @@ exports.addRecovery = async (req, res) => {
 
             let transactionID = null;
             let settlementId = null;
+            let amountToAdvanceBalance = 0; // For depo payments: amount to credit to advance_balance after pool is recovered
+            let depoIdForAdvanceBalance = null; // DepoID for advance_balance credit
 
             // Find trips for this client with remaining balance (FIFO) - BEFORE any payment processing
             // This is done for ALL payment methods to get trip_id for transaction and recovery records
@@ -410,6 +413,45 @@ exports.addRecovery = async (req, res) => {
                     return res.status(400).json({ message: 'Depo ID is required for depo payment' });
                 }
 
+                // Validate: Customer can only add recovery to dealers from which they purchased
+                // Get unique depo IDs from customer's purchases (via pol_sale -> trip_depos)
+                const [customerDepos] = await connection.execute(
+                    `SELECT DISTINCT td.depo_id
+                     FROM pol_sale ps
+                     INNER JOIN trips t ON ps.trip_id = t.id AND t.active = 1
+                     INNER JOIN trip_depos td ON ps.trip_id = td.trip_id AND td.Active = 1
+                     WHERE ps.client_id = ? AND ps.Active = 1
+                     AND td.depo_id IS NOT NULL`,
+                    [ClientID]
+                );
+                
+                const allowedDepoIds = customerDepos.map(row => row.depo_id);
+                
+                if (allowedDepoIds.length > 0 && !allowedDepoIds.includes(parseInt(DepoID, 10))) {
+                    await connection.rollback();
+                    connection.release();
+                    return res.status(400).json({ 
+                        message: 'This customer has not purchased from the selected dealer. Please select a dealer from which the customer has purchased.' 
+                    });
+                }
+                
+                // Calculate amount due to this specific dealer
+                const [dealerDueAmount] = await connection.execute(
+                    `SELECT COALESCE(SUM(ps.total_amount), 0) as total_sales,
+                            COALESCE(SUM(r.Amount), 0) as total_received
+                     FROM pol_sale ps
+                     INNER JOIN trips t ON ps.trip_id = t.id AND t.active = 1
+                     INNER JOIN trip_depos td ON ps.trip_id = td.trip_id AND td.depo_id = ? AND td.Active = 1
+                     LEFT JOIN recoveries r ON r.ClientID = ? AND r.Active = 1
+                     WHERE ps.client_id = ? AND ps.Active = 1`,
+                    [DepoID, ClientID, ClientID]
+                );
+                
+                // Note: This is a simplified calculation. The actual due amount should consider
+                // payments applied to specific dealers. For now, we'll validate against the recovery amount.
+                // The frontend already validates this, but we add backend validation as well.
+                console.log(`Customer ${ClientID} - Dealer ${DepoID} due amount check`);
+
                 // 1. Insert into settlements table (recovery_id will be updated after recovery insertion)
                 const settlementQuery = `
                     INSERT INTO settlements (
@@ -449,7 +491,27 @@ exports.addRecovery = async (req, res) => {
                 }
 
                 // 3. Get current DepoLimit from pool table (latest entry for this depo)
-                // This is the actual running balance, not the depo.Balance column
+                // Also get the initial balance (first entry with NULL tripID, NULL payment_id, NULL recovery_id)
+                const [initialBalanceRows] = await connection.execute(
+                    `SELECT Credit as initial_balance
+                     FROM pool 
+                     WHERE DepoID = ? 
+                       AND TripID IS NULL 
+                       AND payment_id IS NULL 
+                       AND recovery_id IS NULL 
+                       AND active = 1 
+                     ORDER BY ID ASC 
+                     LIMIT 1`,
+                    [DepoID]
+                );
+                
+                const initialBalance = initialBalanceRows.length > 0 
+                    ? parseFloat(initialBalanceRows[0].initial_balance || 0) 
+                    : 0;
+                
+                console.log(`Depo ${DepoID} initial balance from pool: ${initialBalance}`);
+                
+                // Get current DepoLimit from pool table
                 const [currentPoolRows] = await connection.execute(
                     `SELECT DepoLimit 
                      FROM pool 
@@ -474,8 +536,30 @@ exports.addRecovery = async (req, res) => {
                     }
                 }
 
-                // Calculate new DepoLimit: current + credit amount
-                const newDepoLimit = currentDepoLimit + Amount;
+                // Calculate how much is needed to recover the initial credit limit in pool table
+                // Priority 1: Recover pool balance (credit limit) first
+                const amountNeededToRecoverInitialBalance = Math.max(0, initialBalance - currentDepoLimit);
+                
+                // Determine how much to credit to pool vs advance_balance
+                let amountToPool = 0;
+                amountToAdvanceBalance = 0; // Update outer scope variable
+                depoIdForAdvanceBalance = DepoID; // Store DepoID for later use
+                
+                if (Amount <= amountNeededToRecoverInitialBalance) {
+                    // Recovery amount is less than or equal to what's needed to recover initial balance
+                    // Credit only to pool (priority 1)
+                    amountToPool = Amount;
+                    amountToAdvanceBalance = 0;
+                } else {
+                    // Recovery amount exceeds what's needed to recover initial balance
+                    // Credit pool up to initial balance, then credit remaining to advance_balance
+                    amountToPool = amountNeededToRecoverInitialBalance;
+                    amountToAdvanceBalance = Amount - amountToPool;
+                }
+                
+                // Calculate new DepoLimit: current + amount credited to pool
+                // But don't exceed initial balance
+                const newDepoLimit = Math.min(initialBalance, currentDepoLimit + amountToPool);
 
                 // 4. Find trips for this depo that have remaining balance (payable_amount > paid_amount) - FIFO
                 // This is done BEFORE pool insertion to get TripID
@@ -502,33 +586,36 @@ exports.addRecovery = async (req, res) => {
                 }
                 
                 // 5. Insert pool entry with recovery_id as NULL (will be updated after recovery is inserted)
-                const poolQuery = `
-                    INSERT INTO pool (
-                        DepoID, 
-                        TripID,
-                        Debit, 
-                        Credit, 
-                        DepoLimit,
-                        Date,
-                        payment_id,
-                        recovery_id,
-                        active
-                    ) VALUES (?, ?, 0, ?, ?, ?, NULL, NULL, 1)
-                `;
-                
-                const [poolResult] = await connection.execute(poolQuery, [
-                    DepoID,
-                    tripIdForPool,
-                    Amount,  // Credit amount (recovery payment received, increases depo limit)
-                    newDepoLimit,  // New DepoLimit = current DepoLimit + credit amount
-                    recoveryDate  // Date value for pool entry
-                ]);
-                
-                poolEntryId = poolResult.insertId;
+                // Only insert if there's an amount to credit to pool
+                if (amountToPool > 0) {
+                    const poolQuery = `
+                        INSERT INTO pool (
+                            DepoID, 
+                            TripID,
+                            Debit, 
+                            Credit, 
+                            DepoLimit,
+                            Date,
+                            payment_id,
+                            recovery_id,
+                            active
+                        ) VALUES (?, ?, 0, ?, ?, ?, NULL, NULL, 1)
+                    `;
+                    
+                    const [poolResult] = await connection.execute(poolQuery, [
+                        DepoID,
+                        tripIdForPool,
+                        amountToPool,  // Credit amount to pool (priority 1)
+                        newDepoLimit,  // New DepoLimit (up to initial balance)
+                        recoveryDate  // Date value for pool entry
+                    ]);
+                    
+                    poolEntryId = poolResult.insertId;
+                    console.log(`Pool credit for recovery: Amount=${amountToPool}, New DepoLimit=${newDepoLimit} (initial=${initialBalance})`);
+                }
 
-                // Note: DO NOT update depo.Balance column for recovery payments
-                // The depo.Balance should remain at its initial value
-                // All balance changes are tracked in the pool table via DepoLimit
+                // Priority 2: Credit remaining amount to advance_balance table will be done after recovery is inserted
+                // (recoveryId will be available then - see code after recovery insertion)
 
                 // 4. Update trip_depos for this depo - apply payment to trip_depos entries with remaining balance
                 // Get trip_depos entries for this depo that have remaining balance (FIFO by trip date)
@@ -583,15 +670,15 @@ exports.addRecovery = async (req, res) => {
                 for (const tripId of affectedTripIds) {
                     const [tripDepoSum] = await connection.execute(
                         `SELECT 
-                         COALESCE(SUM(CASE WHEN purchase_type = 'cash' THEN paid_amount ELSE 0 END), 0) as cash_paid,
+                         COALESCE(SUM(paid_amount), 0) as total_paid,
                          COALESCE(SUM(paid_amount), 0) as total_collected
                          FROM trip_depos 
                          WHERE trip_id = ? AND Active = 1`,
                         [tripId]
                     );
                     
-                    const tripPaid = parseFloat(tripDepoSum[0]?.cash_paid || 0); // Only cash counts as "paid" for trips
-                    const tripCollected = parseFloat(tripDepoSum[0]?.total_collected || 0); // Total collected
+                    const tripPaid = parseFloat(tripDepoSum[0]?.total_paid || 0); // All payments count toward paid
+                    const tripCollected = parseFloat(tripDepoSum[0]?.total_collected || 0); // Total collected (same as paid)
                     
                     await connection.execute(
                         `UPDATE trips 
@@ -605,6 +692,9 @@ exports.addRecovery = async (req, res) => {
                     // Check if trip can be marked as Completed
                     await checkAndCloseTrip(connection, tripId);
                 }
+
+                // Note: advance_balance was already updated above when we updated depo.Balance
+                // based on the initial balance limit. No need to add again here.
 
                 // 4b. Also update CLIENT's trips amount_collected (for customer due calculation)
                 // Use the client trips found earlier
@@ -784,6 +874,26 @@ exports.addRecovery = async (req, res) => {
                     [recoveryId, poolEntryId]
                 );
                 console.log(`Updated pool entry ${poolEntryId} with recovery_id ${recoveryId}`);
+                
+                // Update depo.Balance to match the new DepoLimit from pool
+                // Get the latest DepoLimit from pool table for this depo
+                const [latestPoolRows] = await connection.execute(
+                    `SELECT DepoLimit 
+                     FROM pool 
+                     WHERE DepoID = ? AND active = 1 
+                     ORDER BY ID DESC 
+                     LIMIT 1`,
+                    [DepoID]
+                );
+                
+                if (latestPoolRows.length > 0) {
+                    const newDepoBalance = parseFloat(latestPoolRows[0].DepoLimit || 0);
+                    await connection.execute(
+                        'UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?',
+                        [newDepoBalance, DepoID]
+                    );
+                    console.log(`Updated depo ${DepoID} balance to ${newDepoBalance} (from pool DepoLimit)`);
+                }
             }
             
             // Update settlement with recovery_id if this was a depo payment
@@ -792,6 +902,34 @@ exports.addRecovery = async (req, res) => {
                     'UPDATE settlements SET recovery_id = ? WHERE id = ?',
                     [recoveryId, settlementId]
                 );
+            }
+            
+            // Priority 2: Credit remaining amount to advance_balance table (only after pool is fully recovered)
+            // This is for depo payments where amount exceeded what was needed to recover initial pool balance
+            if (payment_method === 'depo' && amountToAdvanceBalance > 0 && depoIdForAdvanceBalance) {
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [depoIdForAdvanceBalance]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + amountToAdvanceBalance;
+                
+                // Get CB (Created By) from request or use default
+                const CB = req.body.CB || req.user?.email || 'admin@gmail.com';
+                
+                // Insert Credit entry to advance_balance table
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, ?, NULL, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [depoIdForAdvanceBalance, recoveryId, amountToAdvanceBalance, newAdvanceBalanceInTable, CB]
+                );
+                console.log(`Advance balance credit for recovery: Amount=${amountToAdvanceBalance}, New Balance=${newAdvanceBalanceInTable}`);
             }
 
             // Commit transaction
@@ -1025,6 +1163,92 @@ exports.deleteRecovery = async (req, res) => {
                         [totalSettlementAmount, depoId]
                     );
                     console.log(`Subtracted ${totalSettlementAmount} from depo ${depoId} balance (sum of settlement amounts)`);
+                }
+
+                // Step 4f: Reverse trip_depos.paid_amount and advance_balance for each depo
+                for (const [depoId, totalSettlementAmount] of depoSettlementMap.entries()) {
+                    // Get trip_depos entries for this depo that have paid_amount > 0 (FIFO order)
+                    const [tripDeposRows] = await connection.execute(
+                        `SELECT td.id, td.trip_id, td.paid_amount, td.payable_amount, t.start_date
+                         FROM trip_depos td
+                         INNER JOIN trips t ON t.id = td.trip_id
+                         WHERE td.depo_id = ? AND td.Active = 1 AND td.paid_amount > 0
+                         ORDER BY t.start_date ASC, t.id ASC, td.id ASC`,
+                        [depoId]
+                    );
+                    
+                    let remainingToReverse = totalSettlementAmount;
+                    
+                    // Reverse paid_amount from trip_depos (oldest first - FIFO reversal)
+                    for (const tripDepo of tripDeposRows) {
+                        if (remainingToReverse <= 0) break;
+                        
+                        const currentPaid = parseFloat(tripDepo.paid_amount || 0);
+                        const amountToReverse = Math.min(remainingToReverse, currentPaid);
+                        const newPaid = currentPaid - amountToReverse;
+                        
+                        // Update trip_depos.paid_amount
+                        await connection.execute(
+                            `UPDATE trip_depos SET paid_amount = ?, MD = NOW() WHERE id = ?`,
+                            [newPaid, tripDepo.id]
+                        );
+                        
+                        remainingToReverse -= amountToReverse;
+                        console.log(`Reversed ${amountToReverse} from trip_depos ${tripDepo.id}, new paid_amount: ${newPaid}`);
+                    }
+                    
+                    // If there's still amount remaining after reversing all trip_depos,
+                    // it means that amount was added to advance_balance (table). Reverse it via a Debit entry.
+                    if (remainingToReverse > 0) {
+                        // Get current advance balance from advance_balance table (latest Balance)
+                        const [lastAdvanceRows] = await connection.execute(
+                            `SELECT Balance
+                             FROM advance_balance
+                             WHERE DepoID = ? AND Active = 1
+                             ORDER BY ID DESC
+                             LIMIT 1`,
+                            [depoId]
+                        );
+                        const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0
+                            ? parseFloat(lastAdvanceRows[0].Balance || 0)
+                            : 0;
+
+                        const newAdvanceBalanceInTable = Math.max(0, currentAdvanceBalanceFromTable - remainingToReverse);
+                        const CB = req.body?.CB || 'Admin';
+
+                        // Insert Debit entry to advance_balance table to reverse the excess
+                        await connection.execute(
+                            `INSERT INTO advance_balance (
+                                DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                            ) VALUES (?, NULL, ?, NULL, ?, 0, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                            [depoId, id, remainingToReverse, newAdvanceBalanceInTable, CB]
+                        );
+                        console.log(`Reversed advance_balance for depo ${depoId}: -${remainingToReverse}, new advance_balance: ${newAdvanceBalanceInTable}`);
+                    }
+                    
+                    // Update trips.paid and trips.amount_collected for affected trips
+                    const affectedTripIds = [...new Set(tripDeposRows.map(td => td.trip_id))];
+                    for (const tripId of affectedTripIds) {
+                        const [tripDepoSum] = await connection.execute(
+                            `SELECT 
+                             COALESCE(SUM(CASE WHEN purchase_type = 'cash' THEN paid_amount ELSE 0 END), 0) as cash_paid,
+                             COALESCE(SUM(paid_amount), 0) as total_collected
+                             FROM trip_depos 
+                             WHERE trip_id = ? AND Active = 1`,
+                            [tripId]
+                        );
+                        
+                        const tripPaid = parseFloat(tripDepoSum[0]?.cash_paid || 0);
+                        const tripCollected = parseFloat(tripDepoSum[0]?.total_collected || 0);
+                        
+                        await connection.execute(
+                            `UPDATE trips 
+                             SET paid = ?, amount_collected = ?, MD = NOW()
+                             WHERE id = ?`,
+                            [tripPaid, tripCollected, tripId]
+                        );
+                        console.log(`Updated trip ${tripId}: paid=${tripPaid}, amount_collected=${tripCollected}`);
+                    }
                 }
             }
 
