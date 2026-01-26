@@ -12,6 +12,7 @@ const accountController = require('../controllers/accountcontroller');
 const transactionController = require('../controllers/transactioncontroller');
 const cashInHandController = require('../controllers/cashinhandcontroller');
 const vehicleRentController = require('../controllers/vehiclerentcontroller');
+const vehicleExpensesController = require('../controllers/vehicleexpensescontroller');
 const recoveriesController = require('../controllers/recoveriescontroller');
 const expenseCategoriesController = require('../controllers/expensecategoriescontroller');
 const expensesController = require('../controllers/expensescontroller');
@@ -66,6 +67,13 @@ router.get('/getVehicleRentTransactions', vehicleRentController.getVehicleRentTr
 router.post('/addVehicleRent', vehicleRentController.addVehicleRent);
 router.put('/updateVehicleRent', vehicleRentController.updateVehicleRent);
 router.delete('/deleteVehicleRent/:id', vehicleRentController.deleteVehicleRent);
+
+// Vehicle Expenses
+router.get('/getVehicleExpenses', vehicleExpensesController.getVehicleExpenses);
+router.get('/getVehicleTotalExpenses', vehicleExpensesController.getVehicleTotalExpenses);
+router.get('/getAllVehiclesTotalExpenses', vehicleExpensesController.getAllVehiclesTotalExpenses);
+router.post('/addVehicleExpense', vehicleExpensesController.addVehicleExpense);
+router.delete('/deleteVehicleExpense', vehicleExpensesController.deleteVehicleExpense);
 
 // Customers
 router.get('/getCustomers', customersController.getCustomers);
