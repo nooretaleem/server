@@ -11,7 +11,8 @@ exports.getVehicleExpenses = async (req, res) => {
             return res.status(400).json({ message: 'Vehicle ID is required' });
         }
 
-        const query = `
+        // Get vehicle expenses
+        const expensesQuery = `
             SELECT 
                 ve.id,
                 ve.vehicle_id,
@@ -31,11 +32,49 @@ exports.getVehicleExpenses = async (req, res) => {
             LEFT JOIN trips t ON ve.trip_id = t.id AND t.active = 1
             LEFT JOIN vehicles v ON ve.vehicle_id = v.id
             WHERE ve.vehicle_id = ? AND ve.Active = 1
-            ORDER BY ve.expense_date DESC, ve.CD DESC
         `;
         
-        const [rows] = await db.execute(query, [vehicle_id]);
-        res.json(rows);
+        const [expenseRows] = await db.execute(expensesQuery, [vehicle_id]);
+        
+        // Get vehicle rents for this vehicle
+        const rentsQuery = `
+            SELECT 
+                vr.id,
+                vr.vehicle_id,
+                vr.trip_id,
+                vr.transactionID as transaction_id,
+                COALESCE(t.start_date, vr.CD) as expense_date,
+                'Rent' as expense_type,
+                CONCAT('Distance: ', vr.distance_km, ' KM, Rate: ', vr.rent_per_km, ' PKR/KM') as description,
+                vr.total_rent as amount,
+                vr.CD,
+                vr.MD,
+                vr.CB,
+                vr.Active,
+                t.trip_no,
+                v.number as vehicle_number,
+                1 as is_rent
+            FROM vehicle_rent vr
+            LEFT JOIN trips t ON vr.trip_id = t.id AND t.active = 1
+            LEFT JOIN vehicles v ON vr.vehicle_id = v.id
+            WHERE vr.vehicle_id = ? AND vr.Active = 1
+        `;
+        
+        const [rentRows] = await db.execute(rentsQuery, [vehicle_id]);
+        
+        // Combine expenses and rents, then sort by date
+        const allRows = [...expenseRows, ...rentRows];
+        allRows.sort((a, b) => {
+            const dateA = new Date(a.expense_date || a.CD || 0);
+            const dateB = new Date(b.expense_date || b.CD || 0);
+            if (dateB.getTime() !== dateA.getTime()) {
+                return dateB.getTime() - dateA.getTime();
+            }
+            // If dates are equal, sort by ID descending
+            return (b.id || 0) - (a.id || 0);
+        });
+        
+        res.json(allRows);
     } catch (err) {
         console.error('Error fetching vehicle expenses:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {
@@ -49,7 +88,7 @@ exports.getVehicleExpenses = async (req, res) => {
     }
 };
 
-// Get total expenses for a vehicle
+// Get total expenses for a vehicle (including rent)
 exports.getVehicleTotalExpenses = async (req, res) => {
     try {
         const vehicle_id = req.query.vehicle_id;
@@ -58,15 +97,29 @@ exports.getVehicleTotalExpenses = async (req, res) => {
             return res.status(400).json({ message: 'Vehicle ID is required' });
         }
 
-        const query = `
+        // Get expenses total
+        const expensesQuery = `
             SELECT 
                 COALESCE(SUM(amount), 0) as total_expenses
             FROM vehicle_expenses
             WHERE vehicle_id = ? AND Active = 1
         `;
         
-        const [rows] = await db.execute(query, [vehicle_id]);
-        const total = parseFloat(rows[0]?.total_expenses || 0);
+        const [expenseRows] = await db.execute(expensesQuery, [vehicle_id]);
+        const expensesTotal = parseFloat(expenseRows[0]?.total_expenses || 0);
+        
+        // Get rent total
+        const rentQuery = `
+            SELECT 
+                COALESCE(SUM(total_rent), 0) as total_rent
+            FROM vehicle_rent
+            WHERE vehicle_id = ? AND Active = 1
+        `;
+        
+        const [rentRows] = await db.execute(rentQuery, [vehicle_id]);
+        const rentTotal = parseFloat(rentRows[0]?.total_rent || 0);
+        
+        const total = expensesTotal + rentTotal;
         
         res.json({ total_expenses: total });
     } catch (err) {
@@ -82,10 +135,11 @@ exports.getVehicleTotalExpenses = async (req, res) => {
     }
 };
 
-// Get total expenses for all vehicles (for table display)
+// Get total expenses for all vehicles (for table display, including rent)
 exports.getAllVehiclesTotalExpenses = async (req, res) => {
     try {
-        const query = `
+        // Get expenses totals
+        const expensesQuery = `
             SELECT 
                 vehicle_id,
                 COALESCE(SUM(amount), 0) as total_expenses
@@ -94,12 +148,36 @@ exports.getAllVehiclesTotalExpenses = async (req, res) => {
             GROUP BY vehicle_id
         `;
         
-        const [rows] = await db.execute(query);
+        const [expenseRows] = await db.execute(expensesQuery);
+        
+        // Get rent totals
+        const rentQuery = `
+            SELECT 
+                vehicle_id,
+                COALESCE(SUM(total_rent), 0) as total_rent
+            FROM vehicle_rent
+            WHERE Active = 1
+            GROUP BY vehicle_id
+        `;
+        
+        const [rentRows] = await db.execute(rentQuery);
         
         // Convert to object for easy lookup
         const expensesMap = {};
-        rows.forEach(row => {
+        
+        // Add expenses
+        expenseRows.forEach(row => {
             expensesMap[row.vehicle_id] = parseFloat(row.total_expenses || 0);
+        });
+        
+        // Add rents
+        rentRows.forEach(row => {
+            const vehicleId = row.vehicle_id;
+            if (expensesMap[vehicleId]) {
+                expensesMap[vehicleId] += parseFloat(row.total_rent || 0);
+            } else {
+                expensesMap[vehicleId] = parseFloat(row.total_rent || 0);
+            }
         });
         
         res.json(expensesMap);

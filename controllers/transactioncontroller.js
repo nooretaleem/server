@@ -249,20 +249,18 @@ exports.addPayment = async (req, res) => {
                     paymentID: paymentResult.insertId,
                     advanceBalance: newAdvanceBalanceInTable
                 });
-            } else if (Amount > remainingBalance) {
-                // Payment exceeds remaining balance
-                await connection.rollback();
-                connection.release();
-                return res.status(400).json({ 
-                    message: `Payment amount exceeds remaining balance. Remaining balance: ${remainingBalance.toFixed(2)}, Required payment: ${Amount.toFixed(2)}` 
-                });
             }
             
-            // Normal payment flow: remainingBalance > 0 and Amount <= remainingBalance
+            // Handle payment: Amount can exceed remainingBalance
+            // If Amount > remainingBalance, excess goes to advance_balance
+            const amountToApplyToTrips = Math.min(Amount, remainingBalance);
+            const excessAmount = Math.max(0, Amount - remainingBalance);
+            
             // Calculate how much can be added to Balance (up to initial limit) and how much to advance_balance
+            // Only apply the amount that goes to trips for balance calculation
             const balanceSpaceAvailable = Math.max(0, initialBalance - currentDepoBalance);
-            const amountToBalance = Math.min(Amount, balanceSpaceAvailable);
-            const amountToAdvanceBalance = Amount - amountToBalance;
+            const amountToBalance = Math.min(amountToApplyToTrips, balanceSpaceAvailable);
+            const amountToAdvanceBalance = amountToApplyToTrips - amountToBalance;
             
             const newDepoBalance = currentDepoBalance + amountToBalance;
             const newAdvanceBalance = currentAdvanceBalance + amountToAdvanceBalance;
@@ -311,7 +309,7 @@ exports.addPayment = async (req, res) => {
             );
 
             // 3. Apply payment to trips in order (oldest first) - create separate transaction, payment, and pool row for each trip
-            let remainingPayment = Amount;
+            let remainingPayment = amountToApplyToTrips;
             const transactionPurpose = `Payment to ${depoName}`;
             const paymentIds = [];
             const transactionIds = [];
@@ -440,7 +438,80 @@ exports.addPayment = async (req, res) => {
                 console.log(`Created transaction ${transactionID}, payment ${paymentId}, and pool record for trip ${trip.id} (trip_depo ${tripDepoId}). Applied ${paymentToApply}, New paid_amount: ${newPaidAmount}, Pool balance: ${runningPoolBalance}, Remaining: ${payableAmount - newPaidAmount}`);
             }
 
-            // 5. Update Accounts table - subtract amount from balance
+            // 4.5. Handle excess amount (if Amount > remainingBalance)
+            let excessPaymentId = null;
+            let excessTransactionId = null;
+            if (excessAmount > 0) {
+                // Create transaction for excess amount
+                const excessTransactionQuery = `
+                    INSERT INTO transactions (
+                        AccountID, 
+                        Purpose, 
+                        Debit, 
+                        Credit, 
+                        Date, 
+                        PaymentMode, 
+                        ReferenceNo,
+                        trip_id,
+                        active
+                    ) VALUES (?, ?, ?, 0, NOW(), ?, ?, NULL, 1)
+                `;
+                
+                const [excessTransactionResult] = await connection.execute(excessTransactionQuery, [
+                    AccountID,
+                    `Excess Payment to ${depoName} (Advance)`,
+                    excessAmount,
+                    PaymentMode,
+                    ReferenceNo || null
+                ]);
+                
+                excessTransactionId = excessTransactionResult.insertId;
+                transactionIds.push(excessTransactionId);
+                
+                // Create payment record for excess amount
+                const excessPaymentQuery = `
+                    INSERT INTO payments (
+                        transactionID, 
+                        DepoID,
+                        trip_id,
+                        Amount, 
+                        Date, 
+                        active
+                    ) VALUES (?, ?, NULL, ?, NOW(), 1)
+                `;
+                
+                const [excessPaymentResult] = await connection.execute(excessPaymentQuery, [
+                    excessTransactionId,
+                    DepoID,
+                    excessAmount
+                ]);
+                
+                excessPaymentId = excessPaymentResult.insertId;
+                paymentIds.push(excessPaymentId);
+                
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [DepoID]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + excessAmount;
+                
+                // Insert Credit entry to advance_balance table with payment_id
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, NULL, ?, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [DepoID, excessPaymentId, excessAmount, newAdvanceBalanceInTable, 'admin@gmail.com']
+                );
+                console.log(`Added excess payment to advance_balance: Credit=${excessAmount}, PaymentID=${excessPaymentId}, New Balance=${newAdvanceBalanceInTable}`);
+            }
+
+            // 5. Update Accounts table - subtract full amount from balance
             const updateAccountQuery = `
                 UPDATE accounts 
                 SET Balance = Balance - ?, 
@@ -464,9 +535,12 @@ exports.addPayment = async (req, res) => {
             connection.release();
 
             res.json({
-                message: 'Payment added successfully',
+                message: excessAmount > 0 
+                    ? `Payment added successfully. Applied ${amountToApplyToTrips.toFixed(2)} to trips, ${excessAmount.toFixed(2)} added as advance balance.`
+                    : 'Payment added successfully',
                 transactionIDs: transactionIds,
-                paymentIDs: paymentIds
+                paymentIDs: paymentIds,
+                excessAmount: excessAmount > 0 ? excessAmount : 0
             });
         } catch (err) {
             // Rollback on error
@@ -1232,25 +1306,23 @@ exports.addCashInHandPayment = async (req, res) => {
                     cashInHandId: cashInHandId,
                     advanceBalance: newAdvanceBalanceInTable
                 });
-            } else if (Amount > remainingBalance) {
-                // Payment exceeds remaining balance
-                await connection.rollback();
-                connection.release();
-                return res.status(400).json({ 
-                    message: `Payment amount exceeds remaining balance. Remaining balance: ${remainingBalance.toFixed(2)}, Required payment: ${Amount.toFixed(2)}` 
-                });
             }
             
-            // Normal payment flow: remainingBalance > 0 and Amount <= remainingBalance
+            // Handle payment: Amount can exceed remainingBalance
+            // If Amount > remainingBalance, excess goes to advance_balance
+            const amountToApplyToTrips = Math.min(Amount, remainingBalance);
+            const excessAmount = Math.max(0, Amount - remainingBalance);
+            
             // Calculate how much can be added to Balance (up to initial limit) and how much to advance_balance
+            // Only apply the amount that goes to trips for balance calculation
             const balanceSpaceAvailable = Math.max(0, initialBalance - currentDepoBalance);
-            const amountToBalance = Math.min(Amount, balanceSpaceAvailable);
-            const amountToAdvanceBalance = Amount - amountToBalance;
+            const amountToBalance = Math.min(amountToApplyToTrips, balanceSpaceAvailable);
+            const amountToAdvanceBalance = amountToApplyToTrips - amountToBalance;
             
             const newDepoBalance = currentDepoBalance + amountToBalance;
             const newAdvanceBalance = currentAdvanceBalance + amountToAdvanceBalance;
             
-            console.log(`[Cash Payment] Will add ${amountToBalance} to Balance (space available: ${balanceSpaceAvailable}), ${amountToAdvanceBalance} to advance_balance`);
+            console.log(`[Cash Payment] Will add ${amountToBalance} to Balance (space available: ${balanceSpaceAvailable}), ${amountToAdvanceBalance} to advance_balance. Excess amount: ${excessAmount}`);
 
             // 3. Get Trip No if TripID is provided
             let tripNo = TripNo || '';
@@ -1301,7 +1373,7 @@ exports.addCashInHandPayment = async (req, res) => {
             );
 
             // 7. Apply payment to trips in order (oldest first) - create separate transaction, payment, and pool row for each trip
-            let remainingPayment = Amount;
+            let remainingPayment = amountToApplyToTrips;
             const transactionPurpose = tripNo ? `Payment for ${tripNo}` : `Payment to ${depoName}`;
             const paymentIds = [];
             const transactionIds = [];
@@ -1427,6 +1499,76 @@ exports.addCashInHandPayment = async (req, res) => {
                 console.log(`Created transaction ${transactionID}, payment ${paymentId}, and pool record for trip ${trip.id} (trip_depo ${tripDepoId}). Applied ${paymentToApply}, New paid_amount: ${newPaidAmount}, Pool balance: ${runningPoolBalance}, Remaining: ${payableAmount - newPaidAmount}`);
             }
 
+            // 7.5. Handle excess amount (if Amount > remainingBalance)
+            let excessPaymentId = null;
+            let excessTransactionId = null;
+            if (excessAmount > 0) {
+                // Create transaction for excess amount with cash_in_hand_id
+                const excessTransactionQuery = `
+                    INSERT INTO transactions (
+                        cash_in_hand_id,
+                        Purpose,
+                        Debit,
+                        Credit,
+                        Date,
+                        PaymentMode,
+                        trip_id,
+                        active
+                    ) VALUES (?, ?, ?, 0, NOW(), 'Cash', NULL, 1)
+                `;
+                
+                const [excessTransactionResult] = await connection.execute(excessTransactionQuery, [
+                    cashInHandId,
+                    `Excess Payment to ${depoName} (Advance)`,
+                    excessAmount
+                ]);
+                
+                excessTransactionId = excessTransactionResult.insertId;
+                transactionIds.push(excessTransactionId);
+                
+                // Create payment record for excess amount
+                const excessPaymentQuery = `
+                    INSERT INTO payments (
+                        transactionID, 
+                        DepoID,
+                        trip_id,
+                        Amount, 
+                        Date, 
+                        active
+                    ) VALUES (?, ?, NULL, ?, NOW(), 1)
+                `;
+                
+                const [excessPaymentResult] = await connection.execute(excessPaymentQuery, [
+                    excessTransactionId,
+                    DepoID,
+                    excessAmount
+                ]);
+                
+                excessPaymentId = excessPaymentResult.insertId;
+                paymentIds.push(excessPaymentId);
+                
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [DepoID]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + excessAmount;
+                
+                // Insert Credit entry to advance_balance table with payment_id
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, NULL, ?, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [DepoID, excessPaymentId, excessAmount, newAdvanceBalanceInTable, 'admin@gmail.com']
+                );
+                console.log(`Added excess payment to advance_balance: Credit=${excessAmount}, PaymentID=${excessPaymentId}, New Balance=${newAdvanceBalanceInTable}`);
+            }
+
             // 8. Update depo balance (only Balance column, not advance_balance)
             await connection.execute(
                 `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
@@ -1434,7 +1576,7 @@ exports.addCashInHandPayment = async (req, res) => {
             );
             console.log(`Updated depo ${DepoID}: Balance=${newDepoBalance} (added ${amountToBalance})`);
 
-            // Add advance_balance table entry if there's excess payment (Credit entry)
+            // Add advance_balance table entry if there's excess payment from trips (Credit entry)
             if (amountToAdvanceBalance > 0) {
                 // Get current advance balance from advance_balance table
                 const [lastAdvanceRows] = await connection.execute(
@@ -1463,10 +1605,13 @@ exports.addCashInHandPayment = async (req, res) => {
             connection.release();
 
             res.json({
-                message: 'Cash in hand payment added successfully',
+                message: excessAmount > 0 
+                    ? `Cash in hand payment added successfully. Applied ${amountToApplyToTrips.toFixed(2)} to trips, ${excessAmount.toFixed(2)} added as advance balance.`
+                    : 'Cash in hand payment added successfully',
                 transactionIDs: transactionIds,
                 paymentIDs: paymentIds,
-                cashInHandId: cashInHandId
+                cashInHandId: cashInHandId,
+                excessAmount: excessAmount > 0 ? excessAmount : 0
             });
 
         } catch (err) {
