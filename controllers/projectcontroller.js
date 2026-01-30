@@ -421,9 +421,9 @@ exports.getDashboardData = async (req, res) => {
             const [clientDuesRows] = await db.execute(`
                 SELECT 
                     c.id as client_id,
-                    COALESCE(SUM(ps.total_amount), 0) as total_sales,
-                    COALESCE(SUM(r.Amount), 0) as total_recoveries,
-                    (COALESCE(SUM(ps.total_amount), 0) - COALESCE(SUM(r.Amount), 0)) as due_amount
+                    COALESCE(SUM(CASE WHEN ps.Active = 1 THEN ps.total_amount ELSE 0 END), 0) as total_sales,
+                    COALESCE(SUM(CASE WHEN r.Active = 1 THEN r.Amount ELSE 0 END), 0) as total_recoveries,
+                    (COALESCE(SUM(CASE WHEN ps.Active = 1 THEN ps.total_amount ELSE 0 END), 0) - COALESCE(SUM(CASE WHEN r.Active = 1 THEN r.Amount ELSE 0 END), 0)) as due_amount
                 FROM customers c
                 LEFT JOIN pol_sale ps ON ps.client_id = c.id AND ps.Active = 1
                 LEFT JOIN recoveries r ON r.ClientID = c.id AND r.Active = 1
@@ -601,7 +601,7 @@ exports.getDashboardData = async (req, res) => {
             pendingTripsCount = 0;
         }
 
-        // 6. Get Today's Summary
+        // 6. Get Summary Data
         let tripsToday = 0;
         let fuelPurchased = 0;
         let fuelPurchasedVolume = 0;
@@ -611,22 +611,20 @@ exports.getDashboardData = async (req, res) => {
         let bankTotalToday = 0;
 
         try {
-            // Trips Today
+            // Trips
             const [tripsRows] = await db.execute(`
                 SELECT COUNT(*) as count
                 FROM trips
-                WHERE DATE(start_date) = CURDATE() 
-                  AND active = 1
+                WHERE active = 1
             `);
             tripsToday = parseInt(tripsRows[0]?.count || 0);
 
-            // Fuel Purchased Today - get total amount from trips table
+            // Fuel Purchased - get total amount from trips table
             const [fuelPurchasedRows] = await db.execute(`
                 SELECT 
                     COALESCE(SUM(total_amount), 0) as total
                 FROM trips
-                WHERE DATE(start_date) = CURDATE()
-                  AND active = 1
+                WHERE active = 1
             `);
             fuelPurchased = parseFloat(fuelPurchasedRows[0]?.total || 0);
             
@@ -636,34 +634,32 @@ exports.getDashboardData = async (req, res) => {
                     COALESCE(SUM(tp.quantity_ltr), 0) as volume
                 FROM trips t
                 LEFT JOIN trip_products tp ON t.id = tp.trip_id AND tp.active = 1
-                WHERE DATE(t.start_date) = CURDATE()
-                  AND t.active = 1
+                WHERE t.active = 1
             `);
             fuelPurchasedVolume = parseFloat(fuelPurchasedVolumeRows[0]?.volume || 0);
 
-            // Fuel Sold Today (from pol_sale table) - get both amount and volume
+            // Fuel Sold (from pol_sale table) - get both amount and volume
             const [fuelSoldRows] = await db.execute(`
                 SELECT 
                     COALESCE(SUM(total_amount), 0) as total,
                     COALESCE(SUM(fuel), 0) as volume
                 FROM pol_sale
-                WHERE DATE(date) = CURDATE()
-                  AND Active = 1
+                WHERE Active = 1
             `);
             fuelSold = parseFloat(fuelSoldRows[0]?.total || 0);
             fuelSoldVolume = parseFloat(fuelSoldRows[0]?.volume || 0);
 
-            // Cash in Hand Today - get balance from last record (up to today)
+            // Cash in Hand - get balance from last record
             const [cashTodayAmountRows] = await db.execute(`
                 SELECT balance
                 FROM cash_in_hand
-                WHERE DATE(created_at) <= CURDATE()
+                WHERE Active = 1
                 ORDER BY id DESC
                 LIMIT 1
             `);
             cashInHandToday = parseFloat(cashTodayAmountRows[0]?.balance || 0);
 
-            // Bank Total Today - sum of Balance column from accounts table
+            // Bank Total - sum of Balance column from accounts table
             const [bankTodayRows] = await db.execute(`
                 SELECT COALESCE(SUM(Balance), 0) as total
                 FROM accounts
@@ -671,27 +667,25 @@ exports.getDashboardData = async (req, res) => {
             `);
             bankTotalToday = parseFloat(bankTodayRows[0]?.total || 0);
         } catch (err) {
-            console.error('Error fetching today\'s summary:', err);
+            console.error('Error fetching summary data:', err);
             console.error('Error details:', err.message);
         }
 
-        // 7. Get Total Rent Paid Today (from vehicle_rent table)
+        // 7. Get Total Rent Paid (from vehicle_rent table)
         let totalRentPaidToday = 0;
         try {
             const [rentRows] = await db.execute(`
                 SELECT COALESCE(SUM(total_rent), 0) as total
                 FROM vehicle_rent
-                WHERE DATE(CD) = CURDATE()
-                  AND Active = 1
+                WHERE Active = 1
             `);
             totalRentPaidToday = parseFloat(rentRows[0]?.total || 0);
         } catch (err) {
-            console.error('Error fetching total rent paid today:', err);
+            console.error('Error fetching total rent paid:', err);
             totalRentPaidToday = 0;
         }
 
-        // 8. Get Total Payment to Depos Today (from payments table)
-        // Sum the Amount from payments table - includes both regular and advance payments to dealers
+        // 8. Get Total Payment to Depos (from payments table)
         let totalPaymentToDeposToday = 0;
         try {
             const [paymentToDeposRows] = await db.execute(`
@@ -699,32 +693,27 @@ exports.getDashboardData = async (req, res) => {
                 FROM payments p
                 INNER JOIN transactions t ON t.ID = p.transactionID
                 WHERE (t.Purpose LIKE '%Payment to %' OR t.Purpose LIKE 'Payment for %')
-                  AND DATE(t.Date) = CURDATE()
                   AND t.active = 1
                   AND p.active = 1
                   AND p.DepoID IS NOT NULL
             `);
             totalPaymentToDeposToday = parseFloat(paymentToDeposRows[0]?.total || 0);
-            console.log('Total Payment to Depos Today:', totalPaymentToDeposToday);
         } catch (err) {
-            console.error('Error fetching total payment to depos today:', err);
+            console.error('Error fetching total payment to depos:', err);
             totalPaymentToDeposToday = 0;
         }
 
-        // 9. Get Total Recoveries Today (from recoveries table)
-        // Use MD (Modified Date) column to get recoveries added today
-        // MD is set to NOW() when recovery is inserted, so it reflects when the record was actually added
+        // 9. Get Total Recoveries (from recoveries table)
         let totalRecoveriesToday = 0;
         try {
             const [recoveriesRows] = await db.execute(`
                 SELECT COALESCE(SUM(Amount), 0) as total
                 FROM recoveries
-                WHERE DATE(MD) = CURDATE()
-                  AND Active = 1
+                WHERE Active = 1
             `);
             totalRecoveriesToday = parseFloat(recoveriesRows[0]?.total || 0);
         } catch (err) {
-            console.error('Error fetching total recoveries today:', err);
+            console.error('Error fetching total recoveries:', err);
             totalRecoveriesToday = 0;
         }
 
@@ -1041,7 +1030,7 @@ exports.getExpenditureBreakdown = async (req, res) => {
                 'RENTAL' as category_type,
                 'Vehicle Rent' as category_name,
                 COALESCE(SUM(total_rent), 0) as total_amount
-            FROM vehicle_rent
+            FROM vehicle_rent vr
             WHERE Active = 1
         `);
 
@@ -1059,7 +1048,7 @@ exports.getExpenditureBreakdown = async (req, res) => {
                 'VEHICLE' as category_type,
                 'Vehicle Expenses' as category_name,
                 COALESCE(SUM(amount), 0) as total_amount
-            FROM vehicle_expenses
+            FROM vehicle_expenses ve
             WHERE Active = 1
         `);
 
@@ -1110,6 +1099,118 @@ exports.getBranchesDBSummary = async (req, res) => {
             totalexpense: 0,
             totalprofit: 0
         }]);
+    }
+};
+
+// Get POL Purchase Report
+exports.getPurchaseReport = async (req, res) => {
+    try {
+        const startDate = req.query.startDate || null;
+        const endDate = req.query.endDate || null;
+
+        if (!startDate || !endDate) {
+            return res.status(400).json({ error: 'Start date and end date are required' });
+        }
+
+        const [purchaseRows] = await db.execute(`
+            SELECT 
+                t.trip_no,
+                t.start_date as date,
+                d.name as depo_name,
+                c.name as company_name,
+                tp.product_type,
+                tp.quantity_ltr as fuel,
+                tp.invoice_rate as rate,
+                tp.discount,
+                td.payable_amount as total_amount,
+                COALESCE(td.paid_amount, 0) as paid
+            FROM trip_depos td
+            INNER JOIN trips t ON td.trip_id = t.id AND t.active = 1
+            INNER JOIN trip_products tp ON td.product_id = tp.id AND tp.active = 1
+            LEFT JOIN depo d ON td.depo_id = d.id AND d.active = 1
+            LEFT JOIN depo_company dc ON dc.depo_id = d.id AND dc.active = 1
+            LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
+            WHERE td.Active = 1
+              AND DATE(t.start_date) >= ?
+              AND DATE(t.start_date) <= ?
+            ORDER BY t.start_date DESC, t.id DESC
+        `, [startDate, endDate]);
+
+        res.json(purchaseRows);
+    } catch (err) {
+        console.error('Error fetching purchase report:', err);
+        res.status(500).json({ error: 'Failed to fetch purchase report' });
+    }
+};
+
+// Get Sale Report
+exports.getSaleReport = async (req, res) => {
+    try {
+        const startDate = req.query.startDate || null;
+        const endDate = req.query.endDate || null;
+
+        if (!startDate || !endDate) {
+            return res.status(400).json({ error: 'Start date and end date are required' });
+        }
+
+        const [saleRows] = await db.execute(`
+            SELECT 
+                ps.date,
+                cust.name as client_name,
+                t.trip_no,
+                tp.product_type,
+                ps.fuel,
+                ps.rate,
+                ps.total_amount
+            FROM pol_sale ps
+            INNER JOIN customers cust ON ps.client_id = cust.id AND cust.active = 1
+            LEFT JOIN trips t ON ps.trip_id = t.id AND t.active = 1
+            LEFT JOIN trip_products tp ON ps.trip_product_id = tp.id AND tp.active = 1
+            WHERE ps.Active = 1
+              AND DATE(ps.date) >= ?
+              AND DATE(ps.date) <= ?
+            ORDER BY ps.date DESC, ps.id DESC
+        `, [startDate, endDate]);
+
+        res.json(saleRows);
+    } catch (err) {
+        console.error('Error fetching sale report:', err);
+        res.status(500).json({ error: 'Failed to fetch sale report' });
+    }
+};
+
+// Get Customers Report
+exports.getCustomersReport = async (req, res) => {
+    try {
+        const startDate = req.query.startDate || null;
+        const endDate = req.query.endDate || null;
+
+        if (!startDate || !endDate) {
+            return res.status(400).json({ error: 'Start date and end date are required' });
+        }
+
+        const [customerRows] = await db.execute(`
+            SELECT 
+                c.id as client_id,
+                c.name as client_name,
+                COALESCE(SUM(CASE WHEN ps.Active = 1 AND DATE(ps.date) >= ? AND DATE(ps.date) <= ? THEN ps.total_amount ELSE 0 END), 0) as total_sales,
+                COALESCE(SUM(CASE WHEN ps.Active = 1 AND DATE(ps.date) >= ? AND DATE(ps.date) <= ? THEN ps.fuel ELSE 0 END), 0) as total_fuel,
+                COALESCE(SUM(CASE WHEN r.Active = 1 AND DATE(r.Date) >= ? AND DATE(r.Date) <= ? THEN r.Amount ELSE 0 END), 0) as total_recoveries,
+                (COALESCE(SUM(CASE WHEN ps.Active = 1 AND DATE(ps.date) >= ? AND DATE(ps.date) <= ? THEN ps.total_amount ELSE 0 END), 0) - 
+                 COALESCE(SUM(CASE WHEN r.Active = 1 AND DATE(r.Date) >= ? AND DATE(r.Date) <= ? THEN r.Amount ELSE 0 END), 0)) as due_amount
+            FROM customers c
+            LEFT JOIN pol_sale ps ON ps.client_id = c.id AND ps.Active = 1
+            LEFT JOIN recoveries r ON r.ClientID = c.id AND r.Active = 1
+            WHERE c.active = 1
+            GROUP BY c.id, c.name
+            HAVING total_sales > 0 OR total_recoveries > 0
+            ORDER BY due_amount DESC
+        `, [startDate, endDate, startDate, endDate, startDate, endDate, startDate, endDate, startDate, endDate]);
+
+        res.json(customerRows);
+    } catch (err) {
+        console.error('Error fetching customers report:', err);
+        res.status(500).json({ error: 'Failed to fetch customers report' });
     }
 };
 //Dashboard Functions

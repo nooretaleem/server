@@ -233,4 +233,9 @@ router.post('/addDailySalesSummary', dailySalesSummaryController.addDailySalesSu
 router.post('/updateDailySalesSummary', dailySalesSummaryController.updateDailySalesSummary);
 router.delete('/deleteDailySalesSummary', dailySalesSummaryController.deleteDailySalesSummary);
 
+// Reports
+router.get('/getPurchaseReport', projectController.getPurchaseReport);
+router.get('/getSaleReport', projectController.getSaleReport);
+router.get('/getCustomersReport', projectController.getCustomersReport);
+
 module.exports = router;
