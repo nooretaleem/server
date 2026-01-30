@@ -2300,15 +2300,13 @@ exports.deleteTrip = async (req, res) => {
                 console.log(`\n[LOG] No cash_in_hand_ids found to soft delete`);
             }
             
-            // Set active=0 for all unique accountids
+            // Restore account balances (DO NOT set accounts to active = 0)
+            // Account balances are already restored above in the transaction loop (lines 2234-2246)
+            // We only restore the balance, we don't deactivate the accounts
             if (accountIds.size > 0) {
                 const accountIdsArray = Array.from(accountIds);
-                const accountPlaceholders = accountIdsArray.map(() => '?').join(',');
-                const [accountResult] = await connection.execute(
-                    `UPDATE accounts SET Active = 0, MD = NOW() WHERE ID IN (${accountPlaceholders}) AND Active = 1`,
-                    accountIdsArray
-                );
-                console.log(`Soft deleted ${accountResult.affectedRows} account record(s): ${accountIdsArray.join(', ')}`);
+                console.log(`Account balances restored for account(s): ${accountIdsArray.join(', ')}`);
+                console.log(`Note: Accounts are NOT being deactivated - they remain active for future use`);
             }
         } catch (err) {
             console.log('Error reversing transactions in cash_in_hand and accounts:', err.message);
@@ -2342,7 +2340,7 @@ exports.deleteTrip = async (req, res) => {
         console.log(`  - vehicle_rents: soft deleted`);
         console.log(`  - transactions: soft deleted`);
         console.log(`  - cash_in_hand: soft deleted and balances recalculated`);
-        console.log(`  - accounts: soft deleted and balances adjusted`);
+        console.log(`  - accounts: balances restored (accounts remain active)`);
         console.log(`==========================================\n`);
         
         res.json({ 
@@ -2357,7 +2355,7 @@ exports.deleteTrip = async (req, res) => {
                 recoveries: true,
                 transactions: true,
                 cash_in_hand: true,
-                accounts: true
+                accounts: 'balances restored (accounts remain active)'
             }
         });
     } catch (err) {

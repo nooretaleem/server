@@ -724,6 +724,43 @@ exports.getDashboardData = async (req, res) => {
             totalRecoveriesToday = 0;
         }
 
+        // 10. Get Total Expenditure (sum of personal, business, rental, and vehicle expenses)
+        let totalExpenditure = 0;
+        try {
+            // Personal and Business expenses from expenses table
+            const [personalBusinessRows] = await db.execute(`
+                SELECT COALESCE(SUM(e.amount), 0) as total
+                FROM expenses e
+                LEFT JOIN expense_categories ec ON e.category_id = ec.id
+                LEFT JOIN transactions t ON e.transaction_id = t.ID
+                WHERE e.active = 1 AND t.active = 1
+                  AND ec.expense_type IN ('PERSONAL', 'BUSINESS')
+            `);
+            const personalBusinessTotal = parseFloat(personalBusinessRows[0]?.total || 0);
+
+            // Rental expenses from vehicle_rent table
+            const [rentalRows] = await db.execute(`
+                SELECT COALESCE(SUM(total_rent), 0) as total
+                FROM vehicle_rent
+                WHERE Active = 1
+            `);
+            const rentalTotal = parseFloat(rentalRows[0]?.total || 0);
+
+            // Vehicle expenses from vehicle_expenses table
+            const [vehicleExpenseRows] = await db.execute(`
+                SELECT COALESCE(SUM(amount), 0) as total
+                FROM vehicle_expenses
+                WHERE Active = 1
+            `);
+            const vehicleExpenseTotal = parseFloat(vehicleExpenseRows[0]?.total || 0);
+
+            totalExpenditure = personalBusinessTotal + rentalTotal + vehicleExpenseTotal;
+            console.log(`Total Expenditure: Personal/Business=${personalBusinessTotal}, Rental=${rentalTotal}, Vehicle=${vehicleExpenseTotal}, Total=${totalExpenditure}`);
+        } catch (err) {
+            console.error('Error fetching total expenditure:', err);
+            totalExpenditure = 0;
+        }
+
         res.json({
             cashInHand: cashInHand,
             bankBalance: bankBalance,
@@ -741,7 +778,8 @@ exports.getDashboardData = async (req, res) => {
             bankTotalToday: bankTotalToday,
             totalRentPaidToday: totalRentPaidToday,
             totalPaymentToDeposToday: totalPaymentToDeposToday,
-            totalRecoveriesToday: totalRecoveriesToday
+            totalRecoveriesToday: totalRecoveriesToday,
+            totalExpenditure: totalExpenditure
         });
     } catch (err) {
         console.error('Error fetching dashboard data:', err);
@@ -762,7 +800,7 @@ exports.getDashboardData = async (req, res) => {
 exports.getPendingTrips = async (req, res) => {
     try {
         const [pendingTrips] = await db.execute(`
-            SELECT 
+            SELECT DISTINCT
                 t.id,
                 t.trip_no,
                 t.start_date,
@@ -773,9 +811,15 @@ exports.getPendingTrips = async (req, res) => {
                 t.total_amount,
                 (COALESCE(t.total_amount, 0) - COALESCE(t.paid, 0)) as pending_amount,
                 DATEDIFF(NOW(), t.start_date) as days_pending,
-                t.status
+                t.status,
+                depo.name as depo_name,
+                c.name as company_name
             FROM trips t
             LEFT JOIN vehicles v ON t.vehicle_id = v.id
+            LEFT JOIN trip_depos td ON td.trip_id = t.id AND td.Active = 1
+            LEFT JOIN depo ON td.depo_id = depo.id AND depo.active = 1
+            LEFT JOIN depo_company dc ON dc.depo_id = depo.id AND dc.active = 1
+            LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
             WHERE COALESCE(t.total_amount, 0) > COALESCE(t.paid, 0)
               AND DATEDIFF(NOW(), t.start_date) > 4
               AND t.active = 1
@@ -805,11 +849,16 @@ exports.getCreditTrips = async (req, res) => {
                 t.status,
                 t.total_amount,
                 t.paid,
-                (COALESCE(t.total_amount, 0) - COALESCE(t.paid, 0)) as remaining_amount
+                (COALESCE(t.total_amount, 0) - COALESCE(t.paid, 0)) as remaining_amount,
+                depo.name as depo_name,
+                c.name as company_name
             FROM trips t
             INNER JOIN trip_depos td ON td.trip_id = t.id AND td.Active = 1
             LEFT JOIN vehicles v ON t.vehicle_id = v.id
             LEFT JOIN drivers d ON v.driver_id = d.id
+            LEFT JOIN depo ON td.depo_id = depo.id AND depo.active = 1
+            LEFT JOIN depo_company dc ON dc.depo_id = depo.id AND dc.active = 1
+            LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
             WHERE td.purchase_type = 'credit'
               AND (td.payable_amount - COALESCE(td.paid_amount, 0)) > 0
               AND t.active = 1

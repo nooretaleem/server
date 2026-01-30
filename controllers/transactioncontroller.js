@@ -251,52 +251,87 @@ exports.addPayment = async (req, res) => {
                 });
             }
             
+            // Get current pool balance (actual credit limit from pool table)
+            // CRITICAL: This is the balance BEFORE any payment processing
+            const [currentPoolRows] = await connection.execute(
+                `SELECT DepoLimit, ID, TripID, payment_id, Credit, Debit 
+                 FROM pool 
+                 WHERE DepoID = ? AND active = 1 
+                 ORDER BY ID DESC 
+                 LIMIT 1`,
+                [DepoID]
+            );
+            let currentPoolBalance = currentPoolRows.length > 0 
+                ? parseFloat(currentPoolRows[0].DepoLimit || 0) 
+                : currentDepoBalance;
+            
+            console.log(`=== PAYMENT PROCESSING START ===`);
+            console.log(`DepoID: ${DepoID}, DepoName: ${depoName}`);
+            console.log(`Payment Amount: ${Amount}`);
+            console.log(`Current Pool Balance (from DB): ${currentPoolBalance}`);
+            console.log(`Pool Row Details:`, currentPoolRows.length > 0 ? {
+                ID: currentPoolRows[0].ID,
+                DepoLimit: currentPoolRows[0].DepoLimit,
+                TripID: currentPoolRows[0].TripID,
+                payment_id: currentPoolRows[0].payment_id,
+                Credit: currentPoolRows[0].Credit,
+                Debit: currentPoolRows[0].Debit
+            } : 'No pool row found');
+            console.log(`Current Depo Balance: ${currentDepoBalance}`);
+            console.log(`Remaining Balance (Payable): ${remainingBalance}`);
+            
+            // CRITICAL VALIDATION: Verify we're reading the correct starting balance
+            // If currentPoolBalance doesn't match what we expect, log a warning
+            if (currentPoolRows.length > 0 && currentPoolRows[0].payment_id !== null) {
+                console.log(`⚠️ WARNING: Reading pool balance from a payment-related entry (payment_id=${currentPoolRows[0].payment_id}). This might not be the correct starting balance.`);
+            }
+            
+            // Payment allocation logic (CORRECT ORDER - SAME AS CASH IN HAND):
+            // 1. FIRST: Pay off trips (Amount Payable) - clear the payable amount
+            // 2. SECOND: If amount remains, restore/add to credit limit (pool)
+            // 3. THIRD: If amount still remains, go to advance balance
+            
             // Handle payment: Amount can exceed remainingBalance
             // If Amount > remainingBalance, excess goes to advance_balance
             const amountToApplyToTrips = Math.min(Amount, remainingBalance);
             const excessAmount = Math.max(0, Amount - remainingBalance);
             
-            // Calculate how much can be added to Balance (up to initial limit) and how much to advance_balance
-            // Only apply the amount that goes to trips for balance calculation
-            const balanceSpaceAvailable = Math.max(0, initialBalance - currentDepoBalance);
-            const amountToBalance = Math.min(amountToApplyToTrips, balanceSpaceAvailable);
-            const amountToAdvanceBalance = amountToApplyToTrips - amountToBalance;
+            let remainingPayment = amountToApplyToTrips;
+            let amountToTrips = 0;
+            let amountToRestorePool = 0;
+            let amountToPool = 0;
+            let amountToAdvanceBalance = 0;
             
-            const newDepoBalance = currentDepoBalance + amountToBalance;
-            const newAdvanceBalance = currentAdvanceBalance + amountToAdvanceBalance;
+            // Step 1: FIRST - Pay off trips (Amount Payable)
+            // All payment goes to trips first
+            amountToTrips = remainingPayment;
+            remainingPayment = 0; // All payment is allocated to trips
+            
+            // Step 2: SECOND - Calculate restore/add-to-pool AFTER trips (if there's remaining payment)
+            // Since all payment goes to trips, these will be 0
+            // This is calculated later after trip payments are processed
+            
+            // Step 3: THIRD - Any remaining goes to advance_balance
+            // Also add excess amount (if payment exceeds remainingBalance) to advance_balance
+            amountToAdvanceBalance = excessAmount;
+            
+            // For now, newPoolBalance is just currentPoolBalance
+            // It will be updated after trip payments are processed
+            let newPoolBalance = currentPoolBalance;
+            let newDepoBalance = currentDepoBalance;
+            
+            console.log(`Payment allocation for Depo ${DepoID}:`);
+            console.log(`  Total payment amount: ${Amount}`);
+            console.log(`  Amount payable (remainingBalance): ${remainingBalance}`);
+            console.log(`  Amount to trips: ${amountToTrips}`);
+            console.log(`  Excess amount: ${excessAmount}`);
+            console.log(`  Amount to restore pool: ${amountToRestorePool} (will be calculated after trips)`);
+            console.log(`  Amount to pool: ${amountToPool} (will be calculated after trips)`);
+            console.log(`  Amount to advance_balance: ${amountToAdvanceBalance}`);
+            console.log(`  Starting pool balance: ${currentPoolBalance} (will be updated after trip payments)`);
 
-            // Update depo balance (only the Balance column, not advance_balance)
-            await connection.execute(
-                `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
-                [newDepoBalance, DepoID]
-            );
-            console.log(`Updated depo ${DepoID}: Balance=${newDepoBalance} (added ${amountToBalance})`);
-
-            // Add advance_balance table entry if there's excess payment (Credit entry)
-            if (amountToAdvanceBalance > 0) {
-                // Get current advance balance from advance_balance table
-                const [lastAdvanceRows] = await connection.execute(
-                    `SELECT Balance FROM advance_balance 
-                     WHERE DepoID = ? AND Active = 1 
-                     ORDER BY ID DESC LIMIT 1`,
-                    [DepoID]
-                );
-                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
-                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
-                    : 0;
-                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + amountToAdvanceBalance;
-                
-                // Insert Credit entry to advance_balance table
-                await connection.execute(
-                    `INSERT INTO advance_balance (
-                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
-                    ) VALUES (?, NULL, NULL, NULL, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
-                    [DepoID, amountToAdvanceBalance, newAdvanceBalanceInTable, 'admin@gmail.com']
-                );
-                console.log(`Added advance_balance entry: Credit=${amountToAdvanceBalance}, New Balance=${newAdvanceBalanceInTable}`);
-            }
-
-            // 2. Find trips for this depo that have remaining balance using trip_depos table - FIFO
+            // 2. FIRST - Apply payment to trips (Amount Payable) in order (oldest first)
+            // Find trips for this depo that have remaining balance using trip_depos table - FIFO
             const [tripsWithBalance] = await connection.execute(
                 `SELECT t.id, t.trip_no, t.start_date, td.id as trip_depo_id, td.payable_amount, td.paid_amount,
                  (td.payable_amount - COALESCE(td.paid_amount, 0)) as remaining
@@ -308,149 +343,238 @@ exports.addPayment = async (req, res) => {
                 [DepoID]
             );
 
-            // 3. Apply payment to trips in order (oldest first) - create separate transaction, payment, and pool row for each trip
-            let remainingPayment = amountToApplyToTrips;
+            // Apply payment to trips FIRST - use amountToTrips calculated above
+            // CRITICAL: When paying trips, we create pool entries for each trip payment
+            // These pool entries reflect the credit being restored as trips are paid
             const transactionPurpose = `Payment to ${depoName}`;
             const paymentIds = [];
             const transactionIds = [];
             
-            // Get initial pool balance for calculating running balance
-            const [initialPoolRows] = await connection.execute(
-                `SELECT ID, DepoLimit FROM pool WHERE DepoID = ? AND active = 1 ORDER BY ID DESC LIMIT 1`,
-                [DepoID]
-            );
-            let runningPoolBalance = initialPoolRows.length > 0 ? parseFloat(initialPoolRows[0].DepoLimit || 0) : currentDepoBalance;
+            // Start with current pool balance for calculating running balance
+            // As we pay trips, the pool balance increases (credit is restored)
+            // CRITICAL: Use the currentPoolBalance read from the pool table at the start
+            // This is the balance BEFORE any payment processing
+            let runningPoolBalance = currentPoolBalance;
+            
+            console.log(`Starting trip payment processing:`);
+            console.log(`  Current pool balance (from DB): ${currentPoolBalance}`);
+            console.log(`  Amount to trips: ${amountToTrips}`);
+            console.log(`  Starting runningPoolBalance: ${runningPoolBalance}`);
             
             // Apply payment to trips in order (oldest first)
-            for (const trip of tripsWithBalance) {
-                if (remainingPayment <= 0) break;
+            if (amountToTrips > 0) {
+                let remainingForTrips = amountToTrips;
                 
-                const payableAmount = parseFloat(trip.payable_amount) || 0;
-                const currentPaid = parseFloat(trip.paid_amount) || 0;
-                const remaining = parseFloat(trip.remaining) || 0;
-                const tripDepoId = trip.trip_depo_id;
-                
-                // Calculate how much to apply to this trip_depo
-                const paymentToApply = Math.min(remainingPayment, remaining);
-                
-                // Create a NEW transaction for this trip's payment portion
-                const transactionQuery = `
-                    INSERT INTO transactions (
-                        AccountID, 
-                        Purpose, 
-                        Debit, 
-                        Credit, 
-                        Date, 
-                        PaymentMode, 
-                        ReferenceNo,
-                        trip_id,
-                        active
-                    ) VALUES (?, ?, ?, 0, NOW(), ?, ?, ?, 1)
-                `;
-                
-                const [transactionResult] = await connection.execute(transactionQuery, [
-                    AccountID,
-                    transactionPurpose,
-                    paymentToApply,  // Debit = paymentToApply (money paid out from account for this trip)
-                    PaymentMode,
-                    ReferenceNo || null,
-                    trip.id  // Trip ID for this specific trip
-                ]);
-                
-                const transactionID = transactionResult.insertId;
-                transactionIds.push(transactionID);
+                for (const trip of tripsWithBalance) {
+                    if (remainingForTrips <= 0) {
+                        console.log(`No more remaining payment for trips. Stopping trip payment processing.`);
+                        break;
+                    }
+                    
+                    const payableAmount = parseFloat(trip.payable_amount) || 0;
+                    const currentPaid = parseFloat(trip.paid_amount) || 0;
+                    const remaining = parseFloat(trip.remaining) || 0;
+                    const tripDepoId = trip.trip_depo_id;
+                    
+                    // Calculate how much to apply to this trip_depo
+                    const paymentToApply = Math.min(remainingForTrips, remaining);
+                    
+                    console.log(`Processing trip ${trip.id}: paymentToApply=${paymentToApply}, runningPoolBalance before=${runningPoolBalance}`);
+                    
+                    // Create a NEW transaction for this trip's payment portion
+                    const transactionQuery = `
+                        INSERT INTO transactions (
+                            AccountID, 
+                            Purpose, 
+                            Debit, 
+                            Credit, 
+                            Date, 
+                            PaymentMode, 
+                            ReferenceNo,
+                            trip_id,
+                            active
+                        ) VALUES (?, ?, ?, 0, NOW(), ?, ?, ?, 1)
+                    `;
+                    
+                    const [transactionResult] = await connection.execute(transactionQuery, [
+                        AccountID,
+                        transactionPurpose,
+                        paymentToApply,  // Debit = paymentToApply (money paid out from account for this trip)
+                        PaymentMode,
+                        ReferenceNo || null,
+                        trip.id  // Trip ID for this specific trip
+                    ]);
+                    
+                    const transactionID = transactionResult.insertId;
+                    transactionIds.push(transactionID);
 
-                // Create a NEW payment row for this trip
-                const paymentQuery = `
-                    INSERT INTO payments (
-                        transactionID, 
+                    // Create a NEW payment row for this trip
+                    const paymentQuery = `
+                        INSERT INTO payments (
+                            transactionID, 
+                            DepoID,
+                            trip_id,
+                            Amount, 
+                            Date, 
+                            active
+                        ) VALUES (?, ?, ?, ?, NOW(), 1)
+                    `;
+                    
+                    const [paymentResult] = await connection.execute(paymentQuery, [
+                        transactionID,
                         DepoID,
-                        trip_id,
-                        Amount, 
-                        Date, 
-                        active
-                    ) VALUES (?, ?, ?, ?, NOW(), 1)
-                `;
-                
-                const [paymentResult] = await connection.execute(paymentQuery, [
-                    transactionID,
-                    DepoID,
-                    trip.id,  // Trip ID for this specific trip
-                    paymentToApply  // Amount applied to this trip
-                ]);
-                
-                const paymentId = paymentResult.insertId;
-                paymentIds.push(paymentId);
+                        trip.id,  // Trip ID for this specific trip
+                        paymentToApply  // Amount applied to this trip
+                    ]);
+                    
+                    const paymentId = paymentResult.insertId;
+                    paymentIds.push(paymentId);
 
-                // Create a NEW pool row for this trip
-                runningPoolBalance += paymentToApply;  // Add credit to running balance
-                const poolQuery = `
-                    INSERT INTO pool (
-                        DepoID, 
-                        TripID,
-                        Debit, 
-                        Credit, 
-                        DepoLimit,
-                        payment_id,
-                        recovery_id,
-                        active
-                    ) VALUES (?, ?, 0, ?, ?, ?, NULL, 1)
-                `;
-                
-                await connection.execute(poolQuery, [
-                    DepoID,
-                    trip.id,  // Trip ID for this specific trip
-                    paymentToApply,  // Credit = paymentToApply (money received into depo for this trip)
-                    runningPoolBalance,  // New DepoLimit = Previous Pool Balance + Credit
-                    paymentId  // Link to this trip's payment
-                ]);
+                    // Create a NEW pool row for this trip payment
+                    // When trips are paid, the pool balance increases (credit is restored)
+                    // CRITICAL: Calculate the new balance BEFORE creating the pool entry
+                    const newPoolBalanceForTrip = runningPoolBalance + paymentToApply;
+                    
+                    console.log(`  Pool balance calculation: ${runningPoolBalance} + ${paymentToApply} = ${newPoolBalanceForTrip}`);
+                    
+                    const poolQuery = `
+                        INSERT INTO pool (
+                            DepoID, 
+                            TripID,
+                            Debit, 
+                            Credit, 
+                            DepoLimit,
+                            payment_id,
+                            recovery_id,
+                            active
+                        ) VALUES (?, ?, 0, ?, ?, ?, NULL, 1)
+                    `;
+                    
+                    await connection.execute(poolQuery, [
+                        DepoID,
+                        trip.id,  // Trip ID for this specific trip
+                        paymentToApply,  // Credit = paymentToApply (money received into depo for this trip)
+                        newPoolBalanceForTrip,  // New DepoLimit = Previous Pool Balance + Credit
+                        paymentId  // Link to this trip's payment
+                    ]);
+                    
+                    // Update running balance for next iteration
+                    runningPoolBalance = newPoolBalanceForTrip;
+                    
+                    console.log(`Created pool entry for trip ${trip.id}: Credit=${paymentToApply}, DepoLimit=${newPoolBalanceForTrip}, Updated runningPoolBalance=${runningPoolBalance}`);
 
-                // Update trip_depos.paid_amount
-                const newPaidAmount = currentPaid + paymentToApply;
-                await connection.execute(
-                    `UPDATE trip_depos 
-                     SET paid_amount = ?, MD = NOW()
-                     WHERE id = ?`,
-                    [newPaidAmount, tripDepoId]
-                );
+                    // Update trip_depos.paid_amount
+                    const newPaidAmount = currentPaid + paymentToApply;
+                    await connection.execute(
+                        `UPDATE trip_depos 
+                         SET paid_amount = ?, MD = NOW()
+                         WHERE id = ?`,
+                        [newPaidAmount, tripDepoId]
+                    );
+                    
+                    // Update trips.paid (sum of all trip_depos.paid_amount for this trip)
+                    const [tripDeposSum] = await connection.execute(
+                        `SELECT COALESCE(SUM(paid_amount), 0) as total_paid
+                         FROM trip_depos
+                         WHERE trip_id = ? AND Active = 1`,
+                        [trip.id]
+                    );
+                    const totalPaidForTrip = parseFloat(tripDeposSum[0]?.total_paid || 0);
+                    
+                    await connection.execute(
+                        `UPDATE trips 
+                         SET paid = ?, MD = NOW()
+                         WHERE id = ?`,
+                        [totalPaidForTrip, trip.id]
+                    );
+                    
+                    // Check if trip should be closed (all payments cleared and all fuel sold)
+                    await checkAndCloseTrip(connection, trip.id);
+                    
+                    remainingForTrips -= paymentToApply;
+                    
+                    console.log(`Created transaction ${transactionID}, payment ${paymentId}, and pool record for trip ${trip.id} (trip_depo ${tripDepoId}). Applied ${paymentToApply}, New paid_amount: ${newPaidAmount}, Pool balance: ${runningPoolBalance}, Remaining for trips: ${remainingForTrips}`);
+                }
                 
-                // Update trips.paid (sum of all trip_depos.paid_amount for this trip)
-                const [tripDeposSum] = await connection.execute(
-                    `SELECT COALESCE(SUM(paid_amount), 0) as total_paid
-                     FROM trip_depos
-                     WHERE trip_id = ? AND Active = 1`,
-                    [trip.id]
-                );
-                const totalPaidForTrip = parseFloat(tripDeposSum[0]?.total_paid || 0);
-                
-                await connection.execute(
-                    `UPDATE trips 
-                     SET paid = ?, MD = NOW()
-                     WHERE id = ?`,
-                    [totalPaidForTrip, trip.id]
-                );
-                
-                // Check if trip should be closed (all payments cleared and all fuel sold)
-                await checkAndCloseTrip(connection, trip.id);
-                
-                remainingPayment -= paymentToApply;
-                
-                console.log(`Created transaction ${transactionID}, payment ${paymentId}, and pool record for trip ${trip.id} (trip_depo ${tripDepoId}). Applied ${paymentToApply}, New paid_amount: ${newPaidAmount}, Pool balance: ${runningPoolBalance}, Remaining: ${payableAmount - newPaidAmount}`);
+                // Update currentPoolBalance to reflect the pool balance after trip payments
+                currentPoolBalance = runningPoolBalance;
+                console.log(`Completed trip payments. Final pool balance after trips: ${currentPoolBalance}`);
+            } else {
+                console.log(`No trip payments to process. Amount to trips: ${amountToTrips}`);
             }
+            
+            // Update pool balance after trip payments
+            newPoolBalance = runningPoolBalance;
+            console.log(`Final pool balance after trips: ${newPoolBalance}`);
+            
+            // 3. SECOND - If there's remaining payment after trips, restore/add to pool
+            // Calculate remaining payment after trips (should be 0 since all payment goes to trips)
+            let remainingAfterTrips = remainingPayment; // This should be 0 after all trips are paid
+            
+            if (remainingAfterTrips > 0) {
+                // Step 2a: If pool balance is still negative, restore it
+                if (newPoolBalance < 0) {
+                    amountToRestorePool = Math.min(remainingAfterTrips, Math.abs(newPoolBalance));
+                    remainingAfterTrips -= amountToRestorePool;
+                }
+                
+                // Step 2b: Add remaining payment to pool up to initial limit
+                if (remainingAfterTrips > 0) {
+                    const poolBalanceAfterRestore = newPoolBalance + amountToRestorePool;
+                    const poolSpaceAvailable = Math.max(0, initialBalance - poolBalanceAfterRestore);
+                    amountToPool = Math.min(remainingAfterTrips, poolSpaceAvailable);
+                }
+                
+                // Create pool entries for restore and add-to-pool amounts
+                let poolBalanceForEntries = newPoolBalance;
+                
+                if (amountToRestorePool > 0) {
+                    poolBalanceForEntries += amountToRestorePool;
+                    await connection.execute(
+                        `INSERT INTO pool (
+                            DepoID, TripID, Debit, Credit, DepoLimit, payment_id, recovery_id, active
+                        ) VALUES (?, NULL, 0, ?, ?, NULL, NULL, 1)`,
+                        [DepoID, amountToRestorePool, poolBalanceForEntries]
+                    );
+                    console.log(`Created pool entry for restore: Credit=${amountToRestorePool}, DepoLimit=${poolBalanceForEntries}`);
+                }
+                
+                if (amountToPool > 0) {
+                    poolBalanceForEntries += amountToPool;
+                    await connection.execute(
+                        `INSERT INTO pool (
+                            DepoID, TripID, Debit, Credit, DepoLimit, payment_id, recovery_id, active
+                        ) VALUES (?, NULL, 0, ?, ?, NULL, NULL, 1)`,
+                        [DepoID, amountToPool, poolBalanceForEntries]
+                    );
+                    console.log(`Created pool entry for add-to-pool: Credit=${amountToPool}, DepoLimit=${poolBalanceForEntries}`);
+                }
+                
+                newPoolBalance = poolBalanceForEntries;
+            }
+            
+            // Update depo balance to match the final pool balance
+            // The depo table's Balance column should reflect the actual pool balance after all payments
+            newDepoBalance = newPoolBalance;
+            await connection.execute(
+                `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
+                [newDepoBalance, DepoID]
+            );
+            console.log(`Updated depo ${DepoID}: Balance=${newDepoBalance} (from final pool balance)`);
 
-            // 4.5. Handle excess amount (if Amount > remainingBalance)
+            // 4. THIRD - Handle excess amount (if Amount > remainingBalance)
             let excessPaymentId = null;
             let excessTransactionId = null;
             if (excessAmount > 0) {
                 // Create transaction for excess amount
                 const excessTransactionQuery = `
                     INSERT INTO transactions (
-                        AccountID, 
-                        Purpose, 
-                        Debit, 
-                        Credit, 
-                        Date, 
-                        PaymentMode, 
+                        AccountID,
+                        Purpose,
+                        Debit,
+                        Credit,
+                        Date,
+                        PaymentMode,
                         ReferenceNo,
                         trip_id,
                         active
@@ -509,6 +633,30 @@ exports.addPayment = async (req, res) => {
                     [DepoID, excessPaymentId, excessAmount, newAdvanceBalanceInTable, 'admin@gmail.com']
                 );
                 console.log(`Added excess payment to advance_balance: Credit=${excessAmount}, PaymentID=${excessPaymentId}, New Balance=${newAdvanceBalanceInTable}`);
+            }
+            
+            // Add advance_balance table entry if there's amount going to advance_balance
+            if (amountToAdvanceBalance > 0 && excessAmount === 0) {
+                // Get current advance balance from advance_balance table
+                const [lastAdvanceRows] = await connection.execute(
+                    `SELECT Balance FROM advance_balance 
+                     WHERE DepoID = ? AND Active = 1 
+                     ORDER BY ID DESC LIMIT 1`,
+                    [DepoID]
+                );
+                const currentAdvanceBalanceFromTable = lastAdvanceRows.length > 0 
+                    ? parseFloat(lastAdvanceRows[0].Balance || 0) 
+                    : 0;
+                const newAdvanceBalanceInTable = currentAdvanceBalanceFromTable + amountToAdvanceBalance;
+                
+                // Insert Credit entry to advance_balance table
+                await connection.execute(
+                    `INSERT INTO advance_balance (
+                        DepoID, TripID, recovery_id, payment_id, Debit, Credit, Balance, Date, MD, CD, CB, Active
+                    ) VALUES (?, NULL, NULL, NULL, 0, ?, ?, NOW(), NOW(), NOW(), ?, 1)`,
+                    [DepoID, amountToAdvanceBalance, newAdvanceBalanceInTable, 'admin@gmail.com']
+                );
+                console.log(`Added advance_balance entry: Credit=${amountToAdvanceBalance}, New Balance=${newAdvanceBalanceInTable}`);
             }
 
             // 5. Update Accounts table - subtract full amount from balance
@@ -1120,7 +1268,7 @@ exports.addCashInHandPayment = async (req, res) => {
 
         // Validation
         if (!DepoID) {
-            return res.status(400).json({ message: 'Depo ID is required' });
+            return res.status(400).json({ message: 'Dealer ID is required' });
         }
         if (!Amount || Amount <= 0) {
             return res.status(400).json({ message: 'Amount is required and must be greater than 0' });
@@ -1313,16 +1461,52 @@ exports.addCashInHandPayment = async (req, res) => {
             const amountToApplyToTrips = Math.min(Amount, remainingBalance);
             const excessAmount = Math.max(0, Amount - remainingBalance);
             
-            // Calculate how much can be added to Balance (up to initial limit) and how much to advance_balance
-            // Only apply the amount that goes to trips for balance calculation
-            const balanceSpaceAvailable = Math.max(0, initialBalance - currentDepoBalance);
-            const amountToBalance = Math.min(amountToApplyToTrips, balanceSpaceAvailable);
-            const amountToAdvanceBalance = amountToApplyToTrips - amountToBalance;
+            // Get current pool balance (actual credit limit from pool table)
+            const [currentPoolRows] = await connection.execute(
+                `SELECT DepoLimit FROM pool WHERE DepoID = ? AND active = 1 ORDER BY ID DESC LIMIT 1`,
+                [DepoID]
+            );
+            let currentPoolBalance = currentPoolRows.length > 0 
+                ? parseFloat(currentPoolRows[0].DepoLimit || 0) 
+                : currentDepoBalance;
             
-            const newDepoBalance = currentDepoBalance + amountToBalance;
-            const newAdvanceBalance = currentAdvanceBalance + amountToAdvanceBalance;
+            // Payment allocation logic (CORRECT ORDER):
+            // 1. FIRST: Pay off trips (Amount Payable) - clear the payable amount
+            // 2. SECOND: If amount remains, restore/add to credit limit (pool)
+            // 3. THIRD: If amount still remains, go to advance balance
             
-            console.log(`[Cash Payment] Will add ${amountToBalance} to Balance (space available: ${balanceSpaceAvailable}), ${amountToAdvanceBalance} to advance_balance. Excess amount: ${excessAmount}`);
+            let remainingPayment = amountToApplyToTrips;
+            let amountToTrips = 0;
+            let amountToRestorePool = 0;
+            let amountToPool = 0;
+            let amountToAdvanceBalance = 0;
+            
+            // Step 1: FIRST - Pay off trips (Amount Payable)
+            // All payment goes to trips first
+            amountToTrips = remainingPayment;
+            remainingPayment = 0; // All payment is allocated to trips
+            
+            // Step 2: SECOND - Calculate restore/add-to-pool AFTER trips (if there's remaining payment)
+            // Since all payment goes to trips, these will be 0
+            // This is calculated later after trip payments are processed
+            
+            // Step 3: THIRD - Any remaining goes to advance_balance
+            // Also add excess amount (if payment exceeds remainingBalance) to advance_balance
+            amountToAdvanceBalance = excessAmount;
+            
+            // For now, newPoolBalance is just currentPoolBalance
+            // It will be updated after trip payments are processed
+            let newPoolBalance = currentPoolBalance;
+            let newDepoBalance = currentDepoBalance;
+            
+            console.log(`[Cash Payment] Total Amount: ${Amount}, Remaining Balance for trips: ${remainingBalance}, Excess Amount: ${excessAmount}`);
+            console.log(`[Cash Payment] Current Pool Balance: ${currentPoolBalance}`);
+            console.log(`[Cash Payment] Initial Balance Limit: ${initialBalance}`);
+            console.log(`[Cash Payment] Amount to trips: ${amountToTrips}`);
+            console.log(`[Cash Payment] Amount to restore pool: ${amountToRestorePool} (will be calculated after trips)`);
+            console.log(`[Cash Payment] Amount to pool: ${amountToPool} (will be calculated after trips)`);
+            console.log(`[Cash Payment] Amount to advance_balance: ${amountToAdvanceBalance}`);
+            console.log(`[Cash Payment] Starting pool balance: ${currentPoolBalance} (will be updated after trip payments)`);
 
             // 3. Get Trip No if TripID is provided
             let tripNo = TripNo || '';
@@ -1372,18 +1556,26 @@ exports.addCashInHandPayment = async (req, res) => {
                 [DepoID]
             );
 
-            // 7. Apply payment to trips in order (oldest first) - create separate transaction, payment, and pool row for each trip
-            let remainingPayment = amountToApplyToTrips;
+            // 7. Apply payment to trips FIRST - use amountToTrips calculated above
+            // CRITICAL: When paying trips, we create pool entries for each trip payment
+            // These pool entries reflect the credit being restored as trips are paid
             const transactionPurpose = tripNo ? `Payment for ${tripNo}` : `Payment to ${depoName}`;
             const paymentIds = [];
             const transactionIds = [];
             
-            // Get initial pool balance for calculating running balance
-            const [initialPoolRows] = await connection.execute(
-                `SELECT ID, DepoLimit FROM pool WHERE DepoID = ? AND active = 1 ORDER BY ID DESC LIMIT 1`,
-                [DepoID]
-            );
-            let runningPoolBalance = initialPoolRows.length > 0 ? parseFloat(initialPoolRows[0].DepoLimit || 0) : currentDepoBalance;
+            // Start with current pool balance for calculating running balance
+            // As we pay trips, the pool balance increases (credit is restored)
+            // CRITICAL: Use the currentPoolBalance read from the pool table at the start
+            // This is the balance BEFORE any payment processing
+            let runningPoolBalance = currentPoolBalance;
+            
+            console.log(`[Cash Payment] Starting trip payment processing:`);
+            console.log(`[Cash Payment]   Current pool balance (from DB): ${currentPoolBalance}`);
+            console.log(`[Cash Payment]   Amount to trips: ${amountToTrips}`);
+            console.log(`[Cash Payment]   Starting runningPoolBalance: ${runningPoolBalance}`);
+            
+            // Reset remainingPayment to amountToTrips for trip application
+            remainingPayment = amountToTrips;
             
             // Apply payment to trips in order (oldest first)
             for (const trip of tripsWithBalance) {
@@ -1443,8 +1635,13 @@ exports.addCashInHandPayment = async (req, res) => {
                 const paymentId = paymentResult.insertId;
                 paymentIds.push(paymentId);
 
-                // Create a NEW pool row for this trip
-                runningPoolBalance += paymentToApply;  // Add credit to running balance
+                // Create a NEW pool row for this trip payment
+                // When trips are paid, the pool balance increases (credit is restored)
+                // CRITICAL: Calculate the new balance BEFORE creating the pool entry
+                const newPoolBalanceForTrip = runningPoolBalance + paymentToApply;
+                
+                console.log(`[Cash Payment]   Pool balance calculation: ${runningPoolBalance} + ${paymentToApply} = ${newPoolBalanceForTrip}`);
+                
                 const poolQuery = `
                     INSERT INTO pool (
                         DepoID, 
@@ -1462,9 +1659,14 @@ exports.addCashInHandPayment = async (req, res) => {
                     DepoID,
                     trip.id,  // Trip ID for this specific trip
                     paymentToApply,  // Credit = paymentToApply (money received into depo for this trip)
-                    runningPoolBalance,  // New DepoLimit = Previous Pool Balance + Credit
+                    newPoolBalanceForTrip,  // New DepoLimit = Previous Pool Balance + Credit
                     paymentId  // Link to this trip's payment
                 ]);
+                
+                // Update running balance for next iteration
+                runningPoolBalance = newPoolBalanceForTrip;
+                
+                console.log(`[Cash Payment]   Created pool entry for trip ${trip.id}: Credit=${paymentToApply}, DepoLimit=${newPoolBalanceForTrip}, Updated runningPoolBalance=${runningPoolBalance}`);
 
                 // Update trip_depos.paid_amount
                 const newPaidAmount = currentPaid + paymentToApply;
@@ -1496,10 +1698,69 @@ exports.addCashInHandPayment = async (req, res) => {
                 
                 remainingPayment -= paymentToApply;
                 
-                console.log(`Created transaction ${transactionID}, payment ${paymentId}, and pool record for trip ${trip.id} (trip_depo ${tripDepoId}). Applied ${paymentToApply}, New paid_amount: ${newPaidAmount}, Pool balance: ${runningPoolBalance}, Remaining: ${payableAmount - newPaidAmount}`);
+                console.log(`[Cash Payment] Created transaction ${transactionID}, payment ${paymentId}, and pool record for trip ${trip.id} (trip_depo ${tripDepoId}). Applied ${paymentToApply}, New paid_amount: ${newPaidAmount}, Pool balance: ${runningPoolBalance}, Remaining: ${payableAmount - newPaidAmount}`);
             }
+            
+            // Update pool balance after trip payments
+            newPoolBalance = runningPoolBalance;
+            console.log(`[Cash Payment] Completed trip payments. Final pool balance after trips: ${newPoolBalance}`);
+            
+            // 7.5. SECOND - If there's remaining payment after trips, restore/add to pool
+            // Calculate remaining payment after trips (should be 0 since all payment goes to trips)
+            let remainingAfterTrips = remainingPayment; // This should be 0 after all trips are paid
+            
+            if (remainingAfterTrips > 0) {
+                // Step 2a: If pool balance is still negative, restore it
+                if (newPoolBalance < 0) {
+                    amountToRestorePool = Math.min(remainingAfterTrips, Math.abs(newPoolBalance));
+                    remainingAfterTrips -= amountToRestorePool;
+                }
+                
+                // Step 2b: Add remaining payment to pool up to initial limit
+                if (remainingAfterTrips > 0) {
+                    const poolBalanceAfterRestore = newPoolBalance + amountToRestorePool;
+                    const poolSpaceAvailable = Math.max(0, initialBalance - poolBalanceAfterRestore);
+                    amountToPool = Math.min(remainingAfterTrips, poolSpaceAvailable);
+                }
+                
+                // Create pool entries for restore and add-to-pool amounts
+                let poolBalanceForEntries = newPoolBalance;
+                
+                if (amountToRestorePool > 0) {
+                    poolBalanceForEntries += amountToRestorePool;
+                    await connection.execute(
+                        `INSERT INTO pool (
+                            DepoID, TripID, Debit, Credit, DepoLimit, payment_id, recovery_id, active
+                        ) VALUES (?, NULL, 0, ?, ?, NULL, NULL, 1)`,
+                        [DepoID, amountToRestorePool, poolBalanceForEntries]
+                    );
+                    console.log(`[Cash Payment] Created pool entry for restore: Credit=${amountToRestorePool}, DepoLimit=${poolBalanceForEntries}`);
+                }
+                
+                if (amountToPool > 0) {
+                    poolBalanceForEntries += amountToPool;
+                    await connection.execute(
+                        `INSERT INTO pool (
+                            DepoID, TripID, Debit, Credit, DepoLimit, payment_id, recovery_id, active
+                        ) VALUES (?, NULL, 0, ?, ?, NULL, NULL, 1)`,
+                        [DepoID, amountToPool, poolBalanceForEntries]
+                    );
+                    console.log(`[Cash Payment] Created pool entry for add-to-pool: Credit=${amountToPool}, DepoLimit=${poolBalanceForEntries}`);
+                }
+                
+                newPoolBalance = poolBalanceForEntries;
+            }
+            
+            // Update depo balance to match the final pool balance
+            // The depo table's Balance column should reflect the actual pool balance after all payments
+            newDepoBalance = newPoolBalance;
+            await connection.execute(
+                `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
+                [newDepoBalance, DepoID]
+            );
+            console.log(`[Cash Payment] Updated depo ${DepoID}: Balance=${newDepoBalance} (from final pool balance)`);
 
-            // 7.5. Handle excess amount (if Amount > remainingBalance)
+            // 7.6. Handle excess amount (if Amount > remainingBalance)
             let excessPaymentId = null;
             let excessTransactionId = null;
             if (excessAmount > 0) {
@@ -1574,10 +1835,12 @@ exports.addCashInHandPayment = async (req, res) => {
                 `UPDATE depo SET Balance = ?, MD = NOW() WHERE id = ?`,
                 [newDepoBalance, DepoID]
             );
-            console.log(`Updated depo ${DepoID}: Balance=${newDepoBalance} (added ${amountToBalance})`);
+            console.log(`Updated depo ${DepoID}: Balance=${newDepoBalance}`);
 
-            // Add advance_balance table entry if there's excess payment from trips (Credit entry)
-            if (amountToAdvanceBalance > 0) {
+            // Add advance_balance table entry if there's amount going to advance_balance
+            // NOTE: Only create entry if excessAmount is 0 (excessAmount is already handled above)
+            // amountToAdvanceBalance is set to excessAmount, so we only need to handle it when excessAmount was 0
+            if (amountToAdvanceBalance > 0 && excessAmount === 0) {
                 // Get current advance balance from advance_balance table
                 const [lastAdvanceRows] = await connection.execute(
                     `SELECT Balance FROM advance_balance 
