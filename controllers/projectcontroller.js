@@ -413,27 +413,31 @@ exports.getDashboardData = async (req, res) => {
         }
 
         // 3. Get Total Client Due (Total Sales - Total Payments)
-        // This matches the customer history calculation: Total Amount - Total Received
+        // Calculate per client and sum up, same as getClientDues endpoint
         let totalClientDue = 0;
         try {
-            // Get total sales from pol_sale table (using total_amount)
-            const [salesRows] = await db.execute(`
-                SELECT COALESCE(SUM(total_amount), 0) as total_sales
-                FROM pol_sale
-                WHERE Active = 1
+            // Calculate total client due by summing (sales - recoveries) per client
+            // This ensures accuracy when there are multiple clients
+            const [clientDuesRows] = await db.execute(`
+                SELECT 
+                    c.id as client_id,
+                    COALESCE(SUM(ps.total_amount), 0) as total_sales,
+                    COALESCE(SUM(r.Amount), 0) as total_recoveries,
+                    (COALESCE(SUM(ps.total_amount), 0) - COALESCE(SUM(r.Amount), 0)) as due_amount
+                FROM customers c
+                LEFT JOIN pol_sale ps ON ps.client_id = c.id AND ps.Active = 1
+                LEFT JOIN recoveries r ON r.ClientID = c.id AND r.Active = 1
+                WHERE c.active = 1
+                GROUP BY c.id
+                HAVING due_amount > 0
             `);
-            const totalSales = parseFloat(salesRows[0]?.total_sales || 0);
             
-            // Get total payments from recoveries table (only active recoveries)
-            const [paymentsRows] = await db.execute(`
-                SELECT COALESCE(SUM(Amount), 0) as total_payments
-                FROM recoveries
-                WHERE Active = 1
-            `);
-            const totalPayments = parseFloat(paymentsRows[0]?.total_payments || 0);
+            // Sum all client dues
+            totalClientDue = clientDuesRows.reduce((sum, row) => {
+                return sum + parseFloat(row.due_amount || 0);
+            }, 0);
             
-            // Total Due = Total Sales - Total Payments
-            totalClientDue = totalSales - totalPayments;
+            console.log(`[Dashboard] Total Client Due calculated: ${totalClientDue} (from ${clientDuesRows.length} clients with dues)`);
         } catch (err) {
             console.error('Error fetching total client due:', err);
             totalClientDue = 0;
@@ -960,6 +964,119 @@ exports.getDealerPayables = async (req, res) => {
             message: 'Server Error',
             error: err.message
         });
+    }
+};
+
+// Get client dues using pol_sale and recoveries
+exports.getClientDues = async (req, res) => {
+    try {
+        // Get all clients with their due amounts
+        // Calculate: Total Sales from pol_sale - Total Recoveries from recoveries table
+        const [clientDuesRows] = await db.execute(`
+            SELECT 
+                c.id as client_id,
+                c.name as client_name,
+                COALESCE(SUM(ps.total_amount), 0) as total_sales,
+                COALESCE(SUM(r.Amount), 0) as total_recoveries,
+                (COALESCE(SUM(ps.total_amount), 0) - COALESCE(SUM(r.Amount), 0)) as due_amount
+            FROM customers c
+            LEFT JOIN pol_sale ps ON ps.client_id = c.id AND ps.Active = 1
+            LEFT JOIN recoveries r ON r.ClientID = c.id AND r.Active = 1
+            WHERE c.active = 1
+            GROUP BY c.id, c.name
+            HAVING due_amount > 0
+            ORDER BY due_amount DESC
+        `);
+
+        const clientDues = clientDuesRows.map(row => ({
+            client_id: row.client_id,
+            client_name: row.client_name,
+            total_sales: parseFloat(row.total_sales || 0),
+            total_recoveries: parseFloat(row.total_recoveries || 0),
+            due_amount: parseFloat(row.due_amount || 0)
+        }));
+
+        res.json(clientDues);
+    } catch (err) {
+        console.error('Error fetching client dues:', err);
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
+        });
+    }
+};
+
+exports.getExpenditureBreakdown = async (req, res) => {
+    try {
+        const expenditureBreakdown = [];
+
+        // 1. Personal and Business expenses from expenses table
+        const [personalBusinessRows] = await db.execute(`
+            SELECT 
+                ec.expense_type as category,
+                ec.name as category_name,
+                COALESCE(SUM(e.amount), 0) as total_amount
+            FROM expenses e
+            LEFT JOIN expense_categories ec ON e.category_id = ec.id
+            LEFT JOIN transactions t ON e.transaction_id = t.ID
+            WHERE e.active = 1 AND t.active = 1
+              AND ec.expense_type IN ('PERSONAL', 'BUSINESS')
+            GROUP BY ec.expense_type, ec.name
+            ORDER BY total_amount DESC
+        `);
+
+        // Add Personal and Business expenses
+        for (const row of personalBusinessRows) {
+            expenditureBreakdown.push({
+                category_type: row.category,
+                category_name: row.category_name || row.category,
+                amount: parseFloat(row.total_amount || 0)
+            });
+        }
+
+        // 2. Rental expenses from vehicle_rent table
+        const [rentalRows] = await db.execute(`
+            SELECT 
+                'RENTAL' as category_type,
+                'Vehicle Rent' as category_name,
+                COALESCE(SUM(total_rent), 0) as total_amount
+            FROM vehicle_rent
+            WHERE Active = 1
+        `);
+
+        if (rentalRows.length > 0 && parseFloat(rentalRows[0].total_amount || 0) > 0) {
+            expenditureBreakdown.push({
+                category_type: 'RENTAL',
+                category_name: 'Vehicle Rent',
+                amount: parseFloat(rentalRows[0].total_amount || 0)
+            });
+        }
+
+        // 3. Vehicle expenses from vehicle_expenses table
+        const [vehicleExpenseRows] = await db.execute(`
+            SELECT 
+                'VEHICLE' as category_type,
+                'Vehicle Expenses' as category_name,
+                COALESCE(SUM(amount), 0) as total_amount
+            FROM vehicle_expenses
+            WHERE Active = 1
+        `);
+
+        if (vehicleExpenseRows.length > 0 && parseFloat(vehicleExpenseRows[0].total_amount || 0) > 0) {
+            expenditureBreakdown.push({
+                category_type: 'VEHICLE',
+                category_name: 'Vehicle Expenses',
+                amount: parseFloat(vehicleExpenseRows[0].total_amount || 0)
+            });
+        }
+
+        // Sort by amount descending
+        expenditureBreakdown.sort((a, b) => b.amount - a.amount);
+
+        res.json(expenditureBreakdown);
+    } catch (err) {
+        console.error('Error fetching expenditure breakdown:', err);
+        res.status(500).json({ error: 'Failed to fetch expenditure breakdown' });
     }
 };
 
