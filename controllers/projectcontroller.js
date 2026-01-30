@@ -909,50 +909,51 @@ exports.getDealerPayables = async (req, res) => {
             const depoId = row.depo_id;
             const payableAmount = parseFloat(row.payable_amount || 0);
 
-            // Get total sales from pol_sale for trips belonging to this dealer
-            // pol_sale -> trips -> trip_depos -> depo
-            const [salesRows] = await db.execute(`
-                SELECT COALESCE(SUM(ps.total_amount), 0) as total_sales
-                FROM pol_sale ps
-                INNER JOIN trips t ON ps.trip_id = t.id AND t.active = 1
-                INNER JOIN trip_depos td ON td.trip_id = t.id AND td.depo_id = ? AND td.Active = 1
-                WHERE ps.Active = 1
+            // Get starting credit (InitialLimit from pool table)
+            const [initialLimitRows] = await db.execute(`
+                SELECT COALESCE(p.DepoLimit, d.Balance, 0) as initial_limit
+                FROM depo d
+                LEFT JOIN pool p ON p.DepoID = d.id 
+                    AND p.TripID IS NULL 
+                    AND p.recovery_id IS NULL 
+                    AND p.payment_id IS NULL 
+                    AND p.active = 1
+                WHERE d.id = ?
+                ORDER BY p.ID ASC 
+                LIMIT 1
             `, [depoId]);
 
-            const totalSales = parseFloat(salesRows[0]?.total_sales || 0);
+            const startingCredit = parseFloat(initialLimitRows[0]?.initial_limit || 0);
 
-            // Get total recoveries (payments) allocated to this dealer
-            // Option 1: Through settlements table (if recoveries are allocated via settlements)
-            // Option 2: Through pol_sale matching (recoveries from customers who purchased from this dealer)
-            const [recoveriesFromSettlements] = await db.execute(`
-                SELECT COALESCE(SUM(s.amount), 0) as total_recoveries
-                FROM settlements s
-                INNER JOIN recoveries r ON s.recovery_id = r.ID AND r.Active = 1
-                WHERE s.depo_id = ? AND s.Active = 1
+            // Get current balance from advance_balance table (latest Balance)
+            const [advanceBalanceRows] = await db.execute(`
+                SELECT COALESCE(Balance, 0) as current_balance
+                FROM advance_balance
+                WHERE DepoID = ? AND Active = 1
+                ORDER BY ID DESC
+                LIMIT 1
             `, [depoId]);
 
-            let totalRecoveries = parseFloat(recoveriesFromSettlements[0]?.total_recoveries || 0);
+            const currentBalance = parseFloat(advanceBalanceRows[0]?.current_balance || 0);
 
-            // If no settlements found, calculate from pol_sale matching
-            if (totalRecoveries === 0) {
-                const [recoveriesFromSales] = await db.execute(`
-                    SELECT COALESCE(SUM(r.Amount), 0) as total_recoveries
-                    FROM recoveries r
-                    INNER JOIN pol_sale ps ON r.ClientID = ps.client_id AND ps.Active = 1
-                    INNER JOIN trips t ON ps.trip_id = t.id AND t.active = 1
-                    INNER JOIN trip_depos td ON td.trip_id = t.id AND td.depo_id = ? AND td.Active = 1
-                    WHERE r.Active = 1
-                `, [depoId]);
+            // Get available credit from pool table (last DepoLimit/Balance)
+            const [poolBalanceRows] = await db.execute(`
+                SELECT COALESCE(DepoLimit, 0) as available_credit
+                FROM pool
+                WHERE DepoID = ? AND active = 1
+                ORDER BY ID DESC
+                LIMIT 1
+            `, [depoId]);
 
-                totalRecoveries = parseFloat(recoveriesFromSales[0]?.total_recoveries || 0);
-            }
+            const availableCredit = parseFloat(poolBalanceRows[0]?.available_credit || 0);
 
             dealerPayables.push({
                 depo_id: depoId,
                 depo_name: row.depo_name,
                 company_name: row.company_name || 'N/A',
-                total_sales: totalSales,
-                total_recoveries: totalRecoveries,
+                starting_credit: startingCredit,
+                current_balance: currentBalance,
+                available_credit: availableCredit,
                 payable_amount: payableAmount
             });
         }
