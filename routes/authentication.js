@@ -36,6 +36,7 @@ router.get('/getCurrentUser', dataController.getCurrentUser);
 router.get('/getDashboardData', projectController.getDashboardData);
 router.get('/getPendingTrips', projectController.getPendingTrips);
 router.get('/getCreditTrips', projectController.getCreditTrips);
+router.get('/getDealerPayables', projectController.getDealerPayables);
 
 // Trips
 router.get('/getTrips', tripsController.getTrips);

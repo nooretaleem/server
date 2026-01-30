@@ -874,6 +874,95 @@ exports.getCreditTrips = async (req, res) => {
     }
 };
 
+// Get payable amounts per dealer using pol_sale and recoveries
+exports.getDealerPayables = async (req, res) => {
+    try {
+        // Get all active dealers with their payable amounts
+        // Calculate based on trip_depos (payable_amount - paid_amount) for credit purchases
+        // This matches the dashboard calculation for "Total Payable to Depos"
+        const [dealerPayablesRows] = await db.execute(`
+            SELECT 
+                d.id as depo_id,
+                d.name as depo_name,
+                c.name as company_name,
+                COALESCE(SUM(td.payable_amount - COALESCE(td.paid_amount, 0)), 0) as payable_amount
+            FROM depo d
+            LEFT JOIN depo_company dc ON dc.depo_id = d.id AND dc.active = 1
+            LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
+            LEFT JOIN trip_depos td ON td.depo_id = d.id 
+                AND td.Active = 1 
+                AND (td.payable_amount - COALESCE(td.paid_amount, 0)) > 0
+                AND td.purchase_type != 'cash'
+            WHERE d.active = 1
+            GROUP BY d.id, d.name, c.name
+            HAVING payable_amount > 0
+            ORDER BY payable_amount DESC
+        `);
+
+        const dealerPayables = [];
+
+        for (const row of dealerPayablesRows) {
+            const depoId = row.depo_id;
+            const payableAmount = parseFloat(row.payable_amount || 0);
+
+            // Get total sales from pol_sale for trips belonging to this dealer
+            // pol_sale -> trips -> trip_depos -> depo
+            const [salesRows] = await db.execute(`
+                SELECT COALESCE(SUM(ps.total_amount), 0) as total_sales
+                FROM pol_sale ps
+                INNER JOIN trips t ON ps.trip_id = t.id AND t.active = 1
+                INNER JOIN trip_depos td ON td.trip_id = t.id AND td.depo_id = ? AND td.Active = 1
+                WHERE ps.Active = 1
+            `, [depoId]);
+
+            const totalSales = parseFloat(salesRows[0]?.total_sales || 0);
+
+            // Get total recoveries (payments) allocated to this dealer
+            // Option 1: Through settlements table (if recoveries are allocated via settlements)
+            // Option 2: Through pol_sale matching (recoveries from customers who purchased from this dealer)
+            const [recoveriesFromSettlements] = await db.execute(`
+                SELECT COALESCE(SUM(s.amount), 0) as total_recoveries
+                FROM settlements s
+                INNER JOIN recoveries r ON s.recovery_id = r.ID AND r.Active = 1
+                WHERE s.depo_id = ? AND s.Active = 1
+            `, [depoId]);
+
+            let totalRecoveries = parseFloat(recoveriesFromSettlements[0]?.total_recoveries || 0);
+
+            // If no settlements found, calculate from pol_sale matching
+            if (totalRecoveries === 0) {
+                const [recoveriesFromSales] = await db.execute(`
+                    SELECT COALESCE(SUM(r.Amount), 0) as total_recoveries
+                    FROM recoveries r
+                    INNER JOIN pol_sale ps ON r.ClientID = ps.client_id AND ps.Active = 1
+                    INNER JOIN trips t ON ps.trip_id = t.id AND t.active = 1
+                    INNER JOIN trip_depos td ON td.trip_id = t.id AND td.depo_id = ? AND td.Active = 1
+                    WHERE r.Active = 1
+                `, [depoId]);
+
+                totalRecoveries = parseFloat(recoveriesFromSales[0]?.total_recoveries || 0);
+            }
+
+            dealerPayables.push({
+                depo_id: depoId,
+                depo_name: row.depo_name,
+                company_name: row.company_name || 'N/A',
+                total_sales: totalSales,
+                total_recoveries: totalRecoveries,
+                payable_amount: payableAmount
+            });
+        }
+
+        res.json(dealerPayables);
+    } catch (err) {
+        console.error('Error fetching dealer payables:', err);
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
+        });
+    }
+};
+
 exports.getNovitaRecordsSummary = async (req, res) => {
     try {
         // Return empty array if tables don't exist
