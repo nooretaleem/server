@@ -304,6 +304,99 @@ ORDER BY t.start_date DESC, t.id DESC `;
     }
 };
 
+// Get filtered pol_sales by date range (daily, weekly, monthly, yearly)
+exports.getFilteredPolSales = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly', or undefined for all
+        
+        // Build date range condition if filter is provided
+        let dateCondition = '';
+        if (filter) {
+            const now = new Date();
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            let dateStart = null;
+            let dateEnd = null;
+            
+            switch (filter) {
+                case 'daily':
+                    dateStart = today;
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'weekly':
+                    dateStart = new Date(today);
+                    dateStart.setDate(dateStart.getDate() - 6);
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'monthly':
+                    // Last 30 days: from 30 days ago to start of tomorrow
+                    dateStart = new Date(today);
+                    dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'yearly':
+                    dateStart = new Date(now.getFullYear(), 0, 1);
+                    dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                    break;
+            }
+            
+            if (dateStart && dateEnd) {
+                const formatDateTime = (date) => {
+                    const year = date.getFullYear();
+                    const month = String(date.getMonth() + 1).padStart(2, '0');
+                    const day = String(date.getDate()).padStart(2, '0');
+                    return `${year}-${month}-${day} 00:00:00`;
+                };
+                
+                const startStr = formatDateTime(dateStart);
+                const endStr = formatDateTime(dateEnd);
+                dateCondition = `AND ps.CD >= '${startStr}' AND ps.CD < '${endStr}'`;
+            }
+        }
+        
+        const query = `
+            SELECT 
+                ps.id,
+                ps.trip_id,
+                ps.trip_product_id,
+                ps.client_id,
+                ps.Qty,
+                ps.capacity,
+                ps.fuel,
+                ps.rate,
+                ps.Discount,
+                ps.total_amount,
+                ps.date,
+                ps.container_type,
+                c.name as client_name,
+                t.trip_no,
+                tp.product_type as fuel_type
+            FROM pol_sale ps
+            LEFT JOIN customers c ON ps.client_id = c.id AND c.active = 1
+            LEFT JOIN trips t ON ps.trip_id = t.id AND t.active = 1
+            LEFT JOIN trip_products tp ON ps.trip_product_id = tp.id AND tp.Active = 1
+            WHERE ps.Active = 1
+            ${dateCondition}
+            ORDER BY ps.date DESC, ps.id DESC
+        `;
+        
+        const [rows] = await db.execute(query);
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching filtered pol sales:', err);
+        if (err.code === 'ER_NO_SUCH_TABLE') {
+            res.json([]);
+        } else {
+            res.status(500).json({ 
+                message: 'Server Error', 
+                error: err.message 
+            });
+        }
+    }
+};
+
 // Get today's POL sales (all customers sold fuel today)
 exports.getTodayPolSales = async (req, res) => {
     try {

@@ -613,9 +613,11 @@ exports.getDashboardData = async (req, res) => {
         try {
             // Trips
             const [tripsRows] = await db.execute(`
-                SELECT COUNT(*) as count
-                FROM trips
+               SELECT COUNT(*) AS count
+                FROM pol.trips
                 WHERE active = 1
+                AND CD >= CURDATE()
+                AND CD < CURDATE() + INTERVAL 1 DAY;
             `);
             tripsToday = parseInt(tripsRows[0]?.count || 0);
 
@@ -624,7 +626,8 @@ exports.getDashboardData = async (req, res) => {
                 SELECT 
                     COALESCE(SUM(total_amount), 0) as total
                 FROM trips
-                WHERE active = 1
+                WHERE active = 1  AND CD >= CURDATE()
+                AND CD < CURDATE() + INTERVAL 1 DAY;
             `);
             fuelPurchased = parseFloat(fuelPurchasedRows[0]?.total || 0);
             
@@ -634,7 +637,8 @@ exports.getDashboardData = async (req, res) => {
                     COALESCE(SUM(tp.quantity_ltr), 0) as volume
                 FROM trips t
                 LEFT JOIN trip_products tp ON t.id = tp.trip_id AND tp.active = 1
-                WHERE t.active = 1
+                WHERE t.active = 1  AND t.CD >= CURDATE()
+                AND t.CD < CURDATE() + INTERVAL 1 DAY;
             `);
             fuelPurchasedVolume = parseFloat(fuelPurchasedVolumeRows[0]?.volume || 0);
 
@@ -644,7 +648,8 @@ exports.getDashboardData = async (req, res) => {
                     COALESCE(SUM(total_amount), 0) as total,
                     COALESCE(SUM(fuel), 0) as volume
                 FROM pol_sale
-                WHERE Active = 1
+                WHERE Active = 1  AND pol_sale.CD >= CURDATE()
+                AND pol_sale.CD < CURDATE() + INTERVAL 1 DAY;
             `);
             fuelSold = parseFloat(fuelSoldRows[0]?.total || 0);
             fuelSoldVolume = parseFloat(fuelSoldRows[0]?.volume || 0);
@@ -677,7 +682,8 @@ exports.getDashboardData = async (req, res) => {
             const [rentRows] = await db.execute(`
                 SELECT COALESCE(SUM(total_rent), 0) as total
                 FROM vehicle_rent
-                WHERE Active = 1
+                WHERE Active = 1  AND CD >= CURDATE()
+                AND CD < CURDATE() + INTERVAL 1 DAY;
             `);
             totalRentPaidToday = parseFloat(rentRows[0]?.total || 0);
         } catch (err) {
@@ -695,7 +701,9 @@ exports.getDashboardData = async (req, res) => {
                 WHERE (t.Purpose LIKE '%Payment to %' OR t.Purpose LIKE 'Payment for %')
                   AND t.active = 1
                   AND p.active = 1
-                  AND p.DepoID IS NOT NULL
+                  AND p.DepoID IS NOT NULL 
+                  AND p.CD >= CURDATE()
+                  AND p.CD < CURDATE() + INTERVAL 1 DAY;
             `);
             totalPaymentToDeposToday = parseFloat(paymentToDeposRows[0]?.total || 0);
         } catch (err) {
@@ -709,7 +717,8 @@ exports.getDashboardData = async (req, res) => {
             const [recoveriesRows] = await db.execute(`
                 SELECT COALESCE(SUM(Amount), 0) as total
                 FROM recoveries
-                WHERE Active = 1
+                WHERE Active = 1  AND CD >= CURDATE()
+                AND CD < CURDATE() + INTERVAL 1 DAY;
             `);
             totalRecoveriesToday = parseFloat(recoveriesRows[0]?.total || 0);
         } catch (err) {
@@ -785,6 +794,210 @@ exports.getDashboardData = async (req, res) => {
             depoCreditUsage: [],
             pendingTripsCount: 0,
             creditTripsCount: 0
+        });
+    }
+};
+
+// Get Total Client Due filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredClientDue = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Use range queries (>= and <) for performance, not DATE() function
+        // Filter both sales and payments by the SAME date range
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        let dateRangeInfo = {};
+        
+        switch (filter) {
+            case 'daily':
+                // Today: from start of today to start of tomorrow
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Today', start: dateStart, end: dateEnd };
+                break;
+            case 'weekly':
+                // Last 7 days: from 7 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Last 7 days', start: dateStart, end: dateEnd };
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Current month', start: dateStart, end: dateEnd };
+                break;
+            case 'yearly':
+                // Current year: from first day of year to first day of next year
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                dateRangeInfo = { description: 'Current year', start: dateStart, end: dateEnd };
+                break;
+            default:
+                // Default to daily if invalid filter
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Today', start: dateStart, end: dateEnd };
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Build date range conditions using range queries (>= and <) for performance
+        // Use CD (Created Date) column for date filtering
+        const salesDateRange = `AND ps.CD >= '${startStr}' AND ps.CD < '${endStr}'`;
+        const recoveriesDateRange = `AND r.CD >= '${startStr}' AND r.CD < '${endStr}'`;
+        
+        // Client dues = SUM(sales.net_amount or total_amount) - SUM(payments.amount)
+        // Both filtered by the SAME date range
+        // Use LEFT JOIN so unpaid sales are still counted
+        // Use subqueries to avoid Cartesian product when joining sales and recoveries
+        // Calculate sales and recoveries separately, then combine to get accurate totals
+        const [clientDuesBaseRows] = await db.execute(`
+            SELECT 
+                c.id as client_id,
+                c.name as client_name,
+                -- Purchased: SUM of sales (total_amount) in period (calculated separately)
+                COALESCE((
+                    SELECT IFNULL(SUM(ps.total_amount), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                    AND ps.Active = 1 
+                    ${salesDateRange}
+                ), 0) as total_sales,
+                -- Paid: SUM of recoveries (Amount) in period (calculated separately)
+                COALESCE((
+                    SELECT IFNULL(SUM(r.Amount), 0)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                    AND r.Active = 1 
+                    ${recoveriesDateRange}
+                ), 0) as total_recoveries,
+                -- Get last sale date in period
+                (
+                    SELECT MAX(ps.CD)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                    AND ps.Active = 1 
+                    ${salesDateRange}
+                ) as last_sale_date,
+                -- Get last recovery date in period
+                (
+                    SELECT MAX(r.CD)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                    AND r.Active = 1 
+                    ${recoveriesDateRange}
+                ) as last_recovery_date
+            FROM customers c
+            WHERE c.active = 1
+            -- Only show customers who had activity (sales OR recoveries) in the period
+            HAVING (
+                COALESCE((
+                    SELECT IFNULL(SUM(ps.total_amount), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                    AND ps.Active = 1 
+                    ${salesDateRange}
+                ), 0) > 0 OR
+                COALESCE((
+                    SELECT IFNULL(SUM(r.Amount), 0)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                    AND r.Active = 1 
+                    ${recoveriesDateRange}
+                ), 0) > 0
+            )
+        `);
+        
+        // Calculate due_amount and last_transaction_date for each customer
+        const clientDuesRows = clientDuesBaseRows.map(row => {
+            const total_sales = parseFloat(row.total_sales || 0);
+            const total_recoveries = parseFloat(row.total_recoveries || 0);
+            const due_amount = total_sales - total_recoveries;
+            
+            const last_sale_date = row.last_sale_date || null;
+            const last_recovery_date = row.last_recovery_date || null;
+            
+            const last_transaction_date = 
+                (!last_recovery_date || (last_sale_date && last_sale_date > last_recovery_date)) 
+                    ? last_sale_date 
+                    : last_recovery_date;
+            
+            return {
+                client_id: row.client_id,
+                client_name: row.client_name,
+                total_sales: total_sales,
+                total_recoveries: total_recoveries,
+                due_amount: due_amount,
+                last_sale_date: last_sale_date,
+                last_recovery_date: last_recovery_date,
+                last_transaction_date: last_transaction_date
+            };
+        });
+        
+        // Sum all remaining amounts (only positive remaining, negative means overpaid)
+        const totalClientDue = clientDuesRows.reduce((sum, row) => {
+            const remaining = parseFloat(row.due_amount || 0);
+            // Only add positive remaining amounts (if paid > purchased, remaining is negative, so don't count it)
+            return sum + (remaining > 0 ? remaining : 0);
+        }, 0);
+        
+        // Format date for display
+        const formatDateForDisplay = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+        
+        const actualDateRange = {
+            start: formatDateForDisplay(dateStart),
+            end: formatDateForDisplay(new Date(dateEnd.getTime() - 1)) // Subtract 1 day for display
+        };
+        
+        console.log(`[Filtered Client Due] Filter: ${filter} (${dateRangeInfo.description}), Total: ${totalClientDue} (from ${clientDuesRows.length} clients with dues), Date Range: ${actualDateRange.start} to ${actualDateRange.end}`);
+        
+        res.json({
+            success: true,
+            totalClientDue: totalClientDue,
+            filter: filter,
+            dateRange: actualDateRange,
+            dateRangeDescription: dateRangeInfo.description,
+            clientCount: clientDuesRows.length,
+            clientDetails: clientDuesRows.map(row => ({
+                client_id: row.client_id,
+                client_name: row.client_name,
+                total_sales: parseFloat(row.total_sales || 0),
+                total_recoveries: parseFloat(row.total_recoveries || 0),
+                due_amount: parseFloat(row.due_amount || 0)
+            }))
+        });
+    } catch (err) {
+        console.error('Error fetching filtered client due:', err);
+        res.status(500).json({
+            success: false,
+            message: 'Server Error',
+            error: err.message,
+            totalClientDue: 0
         });
     }
 };
@@ -868,11 +1081,182 @@ exports.getCreditTrips = async (req, res) => {
 };
 
 // Get payable amounts per dealer using pol_sale and recoveries
+// Get Total Payable to Dealers filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredDealerPayables = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Use range queries (>= and <) for performance, not DATE() function
+        // Filter trip_depos by trip date (CD column from trips table)
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        let dateRangeInfo = {};
+        
+        switch (filter) {
+            case 'daily':
+                // Today: from start of today to start of tomorrow
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Today', start: dateStart, end: dateEnd };
+                break;
+            case 'weekly':
+                // Last 7 days: from 7 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Last 7 days', start: dateStart, end: dateEnd };
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Current month', start: dateStart, end: dateEnd };
+                break;
+            case 'yearly':
+                // Current year: from first day of year to first day of next year
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                dateRangeInfo = { description: 'Current year', start: dateStart, end: dateEnd };
+                break;
+            default:
+                // Default to daily if invalid filter
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                dateRangeInfo = { description: 'Today', start: dateStart, end: dateEnd };
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Build date range condition for trips (filter by trip date)
+        const tripDateRange = `AND t.CD >= '${startStr}' AND t.CD < '${endStr}'`;
+        
+        // Calculate total payable to dealers for the filtered period
+        // Join with trips table to filter by trip date
+        const [payableRows] = await db.execute(`
+            SELECT COALESCE(SUM(td.payable_amount - COALESCE(td.paid_amount, 0)), 0) as total_remaining
+            FROM trip_depos td
+            INNER JOIN trips t ON t.id = td.trip_id AND t.active = 1
+            WHERE (td.payable_amount - COALESCE(td.paid_amount, 0)) > 0
+              AND td.purchase_type != 'cash'
+              AND td.Active = 1
+              ${tripDateRange}
+        `);
+        
+        const totalPayableToDealers = parseFloat(payableRows[0]?.total_remaining || 0);
+        
+        // Format date for display
+        const formatDateForDisplay = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+        
+        const actualDateRange = {
+            start: formatDateForDisplay(dateStart),
+            end: formatDateForDisplay(new Date(dateEnd.getTime() - 1)) // Subtract 1 day for display
+        };
+        
+        console.log(`[Filtered Dealer Payables] Filter: ${filter} (${dateRangeInfo.description}), Total: ${totalPayableToDealers}, Date Range: ${actualDateRange.start} to ${actualDateRange.end}`);
+        
+        res.json({
+            success: true,
+            totalPayableToDealers: totalPayableToDealers,
+            filter: filter,
+            dateRange: actualDateRange
+        });
+    } catch (err) {
+        console.error('Error fetching filtered dealer payables:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            totalPayableToDealers: 0 
+        });
+    }
+};
+
 exports.getDealerPayables = async (req, res) => {
     try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly', or undefined for all
+        
+        // Build date range condition if filter is provided
+        let tripDateRange = '';
+        if (filter) {
+            const now = new Date();
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            let dateStart = null;
+            let dateEnd = null;
+            
+            switch (filter) {
+                case 'daily':
+                    dateStart = today;
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'weekly':
+                    dateStart = new Date(today);
+                    dateStart.setDate(dateStart.getDate() - 6);
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'monthly':
+                    // Last 30 days: from 30 days ago to start of tomorrow
+                    dateStart = new Date(today);
+                    dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'yearly':
+                    dateStart = new Date(now.getFullYear(), 0, 1);
+                    dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                    break;
+            }
+            
+            if (dateStart && dateEnd) {
+                const formatDateTime = (date) => {
+                    const year = date.getFullYear();
+                    const month = String(date.getMonth() + 1).padStart(2, '0');
+                    const day = String(date.getDate()).padStart(2, '0');
+                    return `${year}-${month}-${day} 00:00:00`;
+                };
+                
+                const startStr = formatDateTime(dateStart);
+                const endStr = formatDateTime(dateEnd);
+                tripDateRange = `AND t.CD >= '${startStr}' AND t.CD < '${endStr}'`;
+            }
+        }
+        
         // Get all active dealers with their payable amounts
         // Calculate based on trip_depos (payable_amount - paid_amount) for credit purchases
-        // This matches the dashboard calculation for "Total Payable to Depos"
+        // Use subquery to filter by trip date if filter is provided (avoids JOIN issues)
+        let payableCondition = '';
+        if (filter && tripDateRange) {
+            // When filter is provided, only include trip_depos from trips within the date range
+            // Replace all occurrences of 't.CD' with 'CD' for the subquery (no table alias in subquery)
+            const subqueryDateRange = tripDateRange.replace(/t\.CD/g, 'CD');
+            payableCondition = `AND td.trip_id IN (
+                SELECT id FROM trips WHERE active = 1 ${subqueryDateRange}
+            )`;
+        }
+        
         const [dealerPayablesRows] = await db.execute(`
             SELECT 
                 d.id as depo_id,
@@ -886,6 +1270,7 @@ exports.getDealerPayables = async (req, res) => {
                 AND td.Active = 1 
                 AND (td.payable_amount - COALESCE(td.paid_amount, 0)) > 0
                 AND td.purchase_type != 'cash'
+                ${payableCondition}
             WHERE d.active = 1
             GROUP BY d.id, d.name, c.name
             HAVING payable_amount > 0
@@ -960,33 +1345,246 @@ exports.getDealerPayables = async (req, res) => {
 // Get client dues using pol_sale and recoveries
 exports.getClientDues = async (req, res) => {
     try {
-        // Get all clients with their due amounts
-        // Calculate: Total Sales from pol_sale - Total Recoveries from recoveries table
-        const [clientDuesRows] = await db.execute(`
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly', or undefined for all
+        
+        // If no filter, show all-time data
+        if (!filter) {
+            // Get all clients with their all-time due amounts
+            // Use subqueries to avoid Cartesian product when joining sales and recoveries
+            const [clientDuesBaseRows] = await db.execute(`
             SELECT 
                 c.id as client_id,
                 c.name as client_name,
-                COALESCE(SUM(ps.total_amount), 0) as total_sales,
-                COALESCE(SUM(r.Amount), 0) as total_recoveries,
-                (COALESCE(SUM(ps.total_amount), 0) - COALESCE(SUM(r.Amount), 0)) as due_amount
+                    -- Purchased: SUM of all sales (calculated separately)
+                    COALESCE((
+                        SELECT IFNULL(SUM(ps.total_amount), 0)
+                        FROM pol_sale ps
+                        WHERE ps.client_id = c.id AND ps.Active = 1
+                    ), 0) as total_sales,
+                    -- Paid: SUM of all recoveries (calculated separately)
+                    COALESCE((
+                        SELECT IFNULL(SUM(r.Amount), 0)
+                        FROM recoveries r
+                        WHERE r.ClientID = c.id AND r.Active = 1
+                    ), 0) as total_recoveries,
+                    -- Get last sale date
+                    (
+                        SELECT MAX(ps.CD)
+                        FROM pol_sale ps
+                        WHERE ps.client_id = c.id AND ps.Active = 1
+                    ) as last_sale_date,
+                    -- Get last recovery date
+                    (
+                        SELECT MAX(r.CD)
+                        FROM recoveries r
+                        WHERE r.ClientID = c.id AND r.Active = 1
+                    ) as last_recovery_date
             FROM customers c
-            LEFT JOIN pol_sale ps ON ps.client_id = c.id AND ps.Active = 1
-            LEFT JOIN recoveries r ON r.ClientID = c.id AND r.Active = 1
             WHERE c.active = 1
-            GROUP BY c.id, c.name
-            HAVING due_amount > 0
-            ORDER BY due_amount DESC
+                HAVING (
+                    COALESCE((
+                        SELECT IFNULL(SUM(ps.total_amount), 0)
+                        FROM pol_sale ps
+                        WHERE ps.client_id = c.id AND ps.Active = 1
+                    ), 0) - 
+                    COALESCE((
+                        SELECT IFNULL(SUM(r.Amount), 0)
+                        FROM recoveries r
+                        WHERE r.ClientID = c.id AND r.Active = 1
+                    ), 0)
+                ) > 0
+                ORDER BY (
+                    COALESCE((
+                        SELECT IFNULL(SUM(ps.total_amount), 0)
+                        FROM pol_sale ps
+                        WHERE ps.client_id = c.id AND ps.Active = 1
+                    ), 0) - 
+                    COALESCE((
+                        SELECT IFNULL(SUM(r.Amount), 0)
+                        FROM recoveries r
+                        WHERE r.ClientID = c.id AND r.Active = 1
+                    ), 0)
+                ) DESC
         `);
 
-        const clientDues = clientDuesRows.map(row => ({
+            // Calculate due_amount and last_transaction_date for each customer
+            const clientDuesRows = clientDuesBaseRows.map(row => {
+                const total_sales = parseFloat(row.total_sales || 0);
+                const total_recoveries = parseFloat(row.total_recoveries || 0);
+                const due_amount = total_sales - total_recoveries;
+                
+                const last_sale_date = row.last_sale_date || null;
+                const last_recovery_date = row.last_recovery_date || null;
+                
+                const last_transaction_date = 
+                    (!last_recovery_date || (last_sale_date && last_sale_date > last_recovery_date)) 
+                        ? last_sale_date 
+                        : last_recovery_date;
+                
+                return {
             client_id: row.client_id,
             client_name: row.client_name,
-            total_sales: parseFloat(row.total_sales || 0),
-            total_recoveries: parseFloat(row.total_recoveries || 0),
-            due_amount: parseFloat(row.due_amount || 0)
-        }));
+                    total_sales: total_sales,
+                    total_recoveries: total_recoveries,
+                    due_amount: due_amount,
+                    last_sale_date: last_sale_date,
+                    last_recovery_date: last_recovery_date,
+                    last_transaction_date: last_transaction_date
+                };
+            });
 
-        res.json(clientDues);
+            return res.json(clientDuesRows);
+        }
+        
+        // For filtered queries, show only activity in that period
+        // Use range queries (>= and <) for performance, not DATE() function
+        // Filter both sales and payments by the SAME date range
+        let dateStart = null;
+        let dateEnd = null;
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        
+        switch (filter) {
+            case 'daily':
+                // Today: from start of today to start of tomorrow
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                // Last 7 days: from 7 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                // Current year: from first day of year to first day of next year
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = null;
+                dateEnd = null;
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        // Build date range conditions using range queries (>= and <) for performance
+        // Use CD (Created Date) column for date filtering
+        let salesDateRange = '';
+        let recoveriesDateRange = '';
+        
+        if (dateStart && dateEnd) {
+            const startStr = formatDateTime(dateStart);
+            const endStr = formatDateTime(dateEnd);
+            // Use CD column. Use range queries for performance
+            salesDateRange = `AND ps.CD >= '${startStr}' AND ps.CD < '${endStr}'`;
+            recoveriesDateRange = `AND r.CD >= '${startStr}' AND r.CD < '${endStr}'`;
+        }
+        
+        // Use subqueries to avoid Cartesian product when joining sales and recoveries
+        // Calculate sales and recoveries separately, then combine to get accurate totals
+        const [clientDuesBaseRows] = await db.execute(`
+            SELECT 
+                c.id as client_id,
+                c.name as client_name,
+                -- Purchased: SUM of sales (total_amount) in period (calculated separately)
+                COALESCE((
+                    SELECT IFNULL(SUM(ps.total_amount), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                    AND ps.Active = 1 
+                    ${salesDateRange}
+                ), 0) as total_sales,
+                -- Paid: SUM of recoveries (Amount) in period (calculated separately)
+                COALESCE((
+                    SELECT IFNULL(SUM(r.Amount), 0)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                    AND r.Active = 1 
+                    ${recoveriesDateRange}
+                ), 0) as total_recoveries,
+                -- Get last sale date in period
+                (
+                    SELECT MAX(ps.CD)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                    AND ps.Active = 1 
+                    ${salesDateRange}
+                ) as last_sale_date,
+                -- Get last recovery date in period
+                (
+                    SELECT MAX(r.CD)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                    AND r.Active = 1 
+                    ${recoveriesDateRange}
+                ) as last_recovery_date
+            FROM customers c
+            WHERE c.active = 1
+            -- Only show customers who had activity (sales OR recoveries) in the period
+            HAVING (
+                COALESCE((
+                    SELECT IFNULL(SUM(ps.total_amount), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                    AND ps.Active = 1 
+                    ${salesDateRange}
+                ), 0) > 0 OR
+                COALESCE((
+                    SELECT IFNULL(SUM(r.Amount), 0)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                    AND r.Active = 1 
+                    ${recoveriesDateRange}
+                ), 0) > 0
+            )
+            ORDER BY c.name ASC
+        `);
+        
+        // Calculate due_amount and last_transaction_date for each customer
+        const clientDuesRows = clientDuesBaseRows.map(row => {
+            const total_sales = parseFloat(row.total_sales || 0);
+            const total_recoveries = parseFloat(row.total_recoveries || 0);
+            const due_amount = total_sales - total_recoveries;
+            
+            const last_sale_date = row.last_sale_date || null;
+            const last_recovery_date = row.last_recovery_date || null;
+            
+            const last_transaction_date = 
+                (!last_recovery_date || (last_sale_date && last_sale_date > last_recovery_date)) 
+                    ? last_sale_date 
+                    : last_recovery_date;
+            
+            return {
+                client_id: row.client_id,
+                client_name: row.client_name,
+                total_sales: total_sales,
+                total_recoveries: total_recoveries,
+                due_amount: due_amount,
+                last_sale_date: last_sale_date,
+                last_recovery_date: last_recovery_date,
+                last_transaction_date: last_transaction_date
+            };
+        });
+
+        res.json(clientDuesRows);
     } catch (err) {
         console.error('Error fetching client dues:', err);
         res.status(500).json({
@@ -996,8 +1594,673 @@ exports.getClientDues = async (req, res) => {
     }
 };
 
+// Get Total Expenditure filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredExpenditure = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Build date conditions for each expense type
+        const transactionDateRange = `AND t.CD >= '${startStr}' AND t.CD < '${endStr}'`;
+        const vehicleRentDateRange = `AND vr.CD >= '${startStr}' AND vr.CD < '${endStr}'`;
+        const vehicleExpenseDateRange = `AND ve.CD >= '${startStr}' AND ve.CD < '${endStr}'`;
+        
+        let totalExpenditure = 0;
+        
+        try {
+            // Personal and Business expenses from expenses table (filtered by transaction date)
+            const [personalBusinessRows] = await db.execute(`
+                SELECT COALESCE(SUM(e.amount), 0) as total
+                FROM expenses e
+                LEFT JOIN expense_categories ec ON e.category_id = ec.id
+                LEFT JOIN transactions t ON e.transaction_id = t.ID
+                WHERE e.active = 1 AND t.active = 1
+                  AND ec.expense_type IN ('PERSONAL', 'BUSINESS')
+                  ${transactionDateRange}
+            `);
+            const personalBusinessTotal = parseFloat(personalBusinessRows[0]?.total || 0);
+
+            // Rental expenses from vehicle_rent table (filtered by CD)
+            const [rentalRows] = await db.execute(`
+                SELECT COALESCE(SUM(total_rent), 0) as total
+                FROM vehicle_rent vr
+                WHERE Active = 1
+                ${vehicleRentDateRange}
+            `);
+            const rentalTotal = parseFloat(rentalRows[0]?.total || 0);
+
+            // Vehicle expenses from vehicle_expenses table (filtered by CD)
+            const [vehicleExpenseRows] = await db.execute(`
+                SELECT COALESCE(SUM(amount), 0) as total
+                FROM vehicle_expenses ve
+                WHERE Active = 1
+                ${vehicleExpenseDateRange}
+            `);
+            const vehicleExpenseTotal = parseFloat(vehicleExpenseRows[0]?.total || 0);
+
+            totalExpenditure = personalBusinessTotal + rentalTotal + vehicleExpenseTotal;
+            
+            console.log(`[Filtered Expenditure] Filter: ${filter}, Personal/Business=${personalBusinessTotal}, Rental=${rentalTotal}, Vehicle=${vehicleExpenseTotal}, Total=${totalExpenditure}`);
+        } catch (err) {
+            console.error('Error fetching filtered expenditure:', err);
+            totalExpenditure = 0;
+        }
+        
+        res.json({
+            success: true,
+            totalExpenditure: totalExpenditure,
+            filter: filter
+        });
+    } catch (err) {
+        console.error('Error fetching filtered expenditure:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            totalExpenditure: 0 
+        });
+    }
+};
+
+// Get Fuel Purchased filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredFuelPurchased = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Get Fuel Purchased amount from trips table
+        const [fuelPurchasedRows] = await db.execute(`
+            SELECT 
+                COALESCE(SUM(total_amount), 0) as total
+            FROM trips
+            WHERE active = 1
+            AND CD >= ? AND CD < ?
+        `, [startStr, endStr]);
+        
+        const fuelPurchased = parseFloat(fuelPurchasedRows[0]?.total || 0);
+        
+        // Get Fuel Purchased Volume from trip_products
+        const [fuelPurchasedVolumeRows] = await db.execute(`
+            SELECT 
+                COALESCE(SUM(tp.quantity_ltr), 0) as volume
+            FROM trips t
+            LEFT JOIN trip_products tp ON t.id = tp.trip_id AND tp.active = 1
+            WHERE t.active = 1
+            AND t.CD >= ? AND t.CD < ?
+        `, [startStr, endStr]);
+        
+        const fuelPurchasedVolume = parseFloat(fuelPurchasedVolumeRows[0]?.volume || 0);
+        
+        console.log(`[Filtered Fuel Purchased] Filter: ${filter}, Amount: ${fuelPurchased}, Volume: ${fuelPurchasedVolume}`);
+        
+        res.json({
+            success: true,
+            fuelPurchased: fuelPurchased,
+            fuelPurchasedVolume: fuelPurchasedVolume,
+            filter: filter
+        });
+    } catch (err) {
+        console.error('Error fetching filtered fuel purchased:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            fuelPurchased: 0,
+            fuelPurchasedVolume: 0
+        });
+    }
+};
+
+// Get Fuel Sold filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredFuelSold = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Get Fuel Sold amount and volume from pol_sale table
+        const [fuelSoldRows] = await db.execute(`
+            SELECT 
+                COALESCE(SUM(total_amount), 0) as total,
+                COALESCE(SUM(fuel), 0) as volume
+            FROM pol_sale
+            WHERE Active = 1
+            AND CD >= ? AND CD < ?
+        `, [startStr, endStr]);
+        
+        const fuelSold = parseFloat(fuelSoldRows[0]?.total || 0);
+        const fuelSoldVolume = parseFloat(fuelSoldRows[0]?.volume || 0);
+        
+        console.log(`[Filtered Fuel Sold] Filter: ${filter}, Amount: ${fuelSold}, Volume: ${fuelSoldVolume}`);
+        
+        res.json({
+            success: true,
+            fuelSold: fuelSold,
+            fuelSoldVolume: fuelSoldVolume,
+            filter: filter
+        });
+    } catch (err) {
+        console.error('Error fetching filtered fuel sold:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            fuelSold: 0,
+            fuelSoldVolume: 0
+        });
+    }
+};
+
+// Get Rent Paid filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredRentPaid = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Get Total Rent Paid from vehicle_rent table
+        const [rentRows] = await db.execute(`
+            SELECT COALESCE(SUM(total_rent), 0) as total
+            FROM vehicle_rent
+            WHERE Active = 1
+            AND CD >= ? AND CD < ?
+        `, [startStr, endStr]);
+        
+        const totalRentPaid = parseFloat(rentRows[0]?.total || 0);
+        
+        console.log(`[Filtered Rent Paid] Filter: ${filter}, Total: ${totalRentPaid}`);
+        
+        res.json({
+            success: true,
+            totalRentPaid: totalRentPaid,
+            filter: filter
+        });
+    } catch (err) {
+        console.error('Error fetching filtered rent paid:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            totalRentPaid: 0
+        });
+    }
+};
+
+// Get Payments to Dealers filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredPayments = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Get Total Payment to Depos from payments table
+        const [paymentToDeposRows] = await db.execute(`
+            SELECT COALESCE(SUM(p.Amount), 0) as total
+            FROM payments p
+            INNER JOIN transactions t ON t.ID = p.transactionID
+            WHERE (t.Purpose LIKE '%Payment to %' OR t.Purpose LIKE 'Payment for %')
+              AND t.active = 1
+              AND p.active = 1
+              AND p.DepoID IS NOT NULL 
+              AND p.CD >= ? AND p.CD < ?
+        `, [startStr, endStr]);
+        
+        const totalPayments = parseFloat(paymentToDeposRows[0]?.total || 0);
+        
+        console.log(`[Filtered Payments] Filter: ${filter}, Total: ${totalPayments}`);
+        
+        res.json({
+            success: true,
+            totalPayments: totalPayments,
+            filter: filter
+        });
+    } catch (err) {
+        console.error('Error fetching filtered payments:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            totalPayments: 0
+        });
+    }
+};
+
+// Get Recoveries filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredRecoveries = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Get Total Recoveries from recoveries table
+        const [recoveriesRows] = await db.execute(`
+            SELECT COALESCE(SUM(Amount), 0) as total
+            FROM recoveries
+            WHERE Active = 1
+            AND CD >= ? AND CD < ?
+        `, [startStr, endStr]);
+        
+        const totalRecoveries = parseFloat(recoveriesRows[0]?.total || 0);
+        
+        console.log(`[Filtered Recoveries] Filter: ${filter}, Total: ${totalRecoveries}`);
+        
+        res.json({
+            success: true,
+            totalRecoveries: totalRecoveries,
+            filter: filter
+        });
+    } catch (err) {
+        console.error('Error fetching filtered recoveries:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            totalRecoveries: 0
+        });
+    }
+};
+
+// Get Total Trips Count filtered by date range (daily, weekly, monthly, yearly)
+exports.getFilteredTripsCount = async (req, res) => {
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        // Count trips in the filtered period
+        const [tripsRows] = await db.execute(`
+            SELECT COUNT(*) AS count
+            FROM trips
+            WHERE active = 1
+            AND CD >= ? AND CD < ?
+        `, [startStr, endStr]);
+        
+        const tripsCount = parseInt(tripsRows[0]?.count || 0);
+        
+        console.log(`[Filtered Trips Count] Filter: ${filter}, Count: ${tripsCount}`);
+        
+        res.json({
+            success: true,
+            tripsCount: tripsCount,
+            filter: filter
+        });
+    } catch (err) {
+        console.error('Error fetching filtered trips count:', err);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Server Error', 
+            error: err.message, 
+            tripsCount: 0 
+        });
+    }
+};
+
 exports.getExpenditureBreakdown = async (req, res) => {
     try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly', or undefined for all
+        
+        // Build date range conditions if filter is provided
+        let transactionDateRange = '';
+        let vehicleRentDateRange = '';
+        let vehicleExpenseDateRange = '';
+        
+        if (filter) {
+            const now = new Date();
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            let dateStart = null;
+            let dateEnd = null;
+            
+            switch (filter) {
+                case 'daily':
+                    dateStart = today;
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'weekly':
+                    dateStart = new Date(today);
+                    dateStart.setDate(dateStart.getDate() - 6);
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'monthly':
+                    // Last 30 days: from 30 days ago to start of tomorrow
+                    dateStart = new Date(today);
+                    dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                    dateEnd = new Date(today);
+                    dateEnd.setDate(dateEnd.getDate() + 1);
+                    break;
+                case 'yearly':
+                    dateStart = new Date(now.getFullYear(), 0, 1);
+                    dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                    break;
+            }
+            
+            if (dateStart && dateEnd) {
+                const formatDateTime = (date) => {
+                    const year = date.getFullYear();
+                    const month = String(date.getMonth() + 1).padStart(2, '0');
+                    const day = String(date.getDate()).padStart(2, '0');
+                    return `${year}-${month}-${day} 00:00:00`;
+                };
+                
+                const startStr = formatDateTime(dateStart);
+                const endStr = formatDateTime(dateEnd);
+                transactionDateRange = `AND t.CD >= '${startStr}' AND t.CD < '${endStr}'`;
+                vehicleRentDateRange = `AND vr.CD >= '${startStr}' AND vr.CD < '${endStr}'`;
+                vehicleExpenseDateRange = `AND ve.CD >= '${startStr}' AND ve.CD < '${endStr}'`;
+            }
+        }
+        
         const expenditureBreakdown = [];
 
         // 1. Personal and Business expenses from expenses table
@@ -1005,12 +2268,14 @@ exports.getExpenditureBreakdown = async (req, res) => {
             SELECT 
                 ec.expense_type as category,
                 ec.name as category_name,
-                COALESCE(SUM(e.amount), 0) as total_amount
+                COALESCE(SUM(e.amount), 0) as total_amount,
+                MAX(t.CD) as last_date
             FROM expenses e
             LEFT JOIN expense_categories ec ON e.category_id = ec.id
             LEFT JOIN transactions t ON e.transaction_id = t.ID
             WHERE e.active = 1 AND t.active = 1
               AND ec.expense_type IN ('PERSONAL', 'BUSINESS')
+              ${transactionDateRange}
             GROUP BY ec.expense_type, ec.name
             ORDER BY total_amount DESC
         `);
@@ -1020,7 +2285,8 @@ exports.getExpenditureBreakdown = async (req, res) => {
             expenditureBreakdown.push({
                 category_type: row.category,
                 category_name: row.category_name || row.category,
-                amount: parseFloat(row.total_amount || 0)
+                amount: parseFloat(row.total_amount || 0),
+                last_date: row.last_date || null
             });
         }
 
@@ -1029,16 +2295,19 @@ exports.getExpenditureBreakdown = async (req, res) => {
             SELECT 
                 'RENTAL' as category_type,
                 'Vehicle Rent' as category_name,
-                COALESCE(SUM(total_rent), 0) as total_amount
+                COALESCE(SUM(total_rent), 0) as total_amount,
+                MAX(vr.CD) as last_date
             FROM vehicle_rent vr
             WHERE Active = 1
+            ${vehicleRentDateRange}
         `);
 
         if (rentalRows.length > 0 && parseFloat(rentalRows[0].total_amount || 0) > 0) {
             expenditureBreakdown.push({
                 category_type: 'RENTAL',
                 category_name: 'Vehicle Rent',
-                amount: parseFloat(rentalRows[0].total_amount || 0)
+                amount: parseFloat(rentalRows[0].total_amount || 0),
+                last_date: rentalRows[0].last_date || null
             });
         }
 
@@ -1047,16 +2316,19 @@ exports.getExpenditureBreakdown = async (req, res) => {
             SELECT 
                 'VEHICLE' as category_type,
                 'Vehicle Expenses' as category_name,
-                COALESCE(SUM(amount), 0) as total_amount
+                COALESCE(SUM(amount), 0) as total_amount,
+                MAX(ve.CD) as last_date
             FROM vehicle_expenses ve
             WHERE Active = 1
+            ${vehicleExpenseDateRange}
         `);
 
         if (vehicleExpenseRows.length > 0 && parseFloat(vehicleExpenseRows[0].total_amount || 0) > 0) {
             expenditureBreakdown.push({
                 category_type: 'VEHICLE',
                 category_name: 'Vehicle Expenses',
-                amount: parseFloat(vehicleExpenseRows[0].total_amount || 0)
+                amount: parseFloat(vehicleExpenseRows[0].total_amount || 0),
+                last_date: vehicleExpenseRows[0].last_date || null
             });
         }
 
@@ -1620,6 +2892,262 @@ exports.assignProjecttoUsers = async (req, res) => {
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'Server Error' });
+    }
+};
+
+// Get Today's Rent Payments
+exports.getTodayRentPayments = async (req, res) => {
+    const db = require('../models/db');
+    
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        const [rows] = await db.execute(`
+            SELECT 
+                vr.id,
+                vr.trip_id,
+                t.trip_no,
+                v.number as vehicle_no,
+                v.type as vehicle_type,
+                vr.distance_km,
+                vr.rent_per_km,
+                vr.total_rent,
+                tr.PaymentMode as payment_source,
+                vr.transactionID,
+                tr.AccountID,
+                a.AccountTitle as account_name,
+                vr.CD as created_date
+            FROM vehicle_rent vr
+            LEFT JOIN trips t ON t.id = vr.trip_id AND t.active = 1
+            LEFT JOIN vehicles v ON v.id = vr.vehicle_id AND v.active = 1
+            LEFT JOIN transactions tr ON tr.ID = vr.transactionID AND tr.active = 1
+            LEFT JOIN accounts a ON a.ID = tr.AccountID AND a.active = 1
+            WHERE vr.Active = 1
+              AND vr.CD >= ? AND vr.CD < ?
+            ORDER BY vr.CD DESC
+        `, [startStr, endStr]);
+        
+        res.json(rows || []);
+    } catch (err) {
+        console.error('Error fetching rent payments:', err);
+        res.status(500).json({ message: 'Error fetching rent payments', error: err.message });
+    }
+};
+
+// Get Payments to Dealers (filtered by date range)
+exports.getTodayDealerPayments = async (req, res) => {
+    const db = require('../models/db');
+    
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        const [rows] = await db.execute(`
+            SELECT 
+                p.id,
+                p.transactionID,
+                p.DepoID,
+                d.name as depo_name,
+                c.name as company_name,
+                p.Amount,
+                t.Purpose,
+                t.PaymentMode as PaymentMethod,
+                t.AccountID,
+                a.AccountTitle as account_name,
+                p.CD as created_date
+            FROM payments p
+            INNER JOIN transactions t ON t.ID = p.transactionID AND t.active = 1
+            LEFT JOIN depo d ON d.id = p.DepoID AND d.active = 1
+            LEFT JOIN depo_company dc ON dc.depo_id = d.id AND dc.active = 1
+            LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
+            LEFT JOIN accounts a ON a.ID = t.AccountID AND a.active = 1
+            WHERE (t.Purpose LIKE '%Payment to %' OR t.Purpose LIKE 'Payment for %')
+              AND t.active = 1
+              AND p.active = 1
+              AND p.DepoID IS NOT NULL
+              AND p.CD >= ? AND p.CD < ?
+            ORDER BY p.CD DESC
+        `, [startStr, endStr]);
+        
+        res.json(rows || []);
+    } catch (err) {
+        console.error('Error fetching dealer payments:', err);
+        res.status(500).json({ message: 'Error fetching dealer payments', error: err.message });
+    }
+};
+
+// Get Recoveries (filtered by date range)
+exports.getTodayRecoveries = async (req, res) => {
+    const db = require('../models/db');
+    
+    try {
+        const { filter } = req.query; // Get filter from query params: 'daily', 'weekly', 'monthly', 'yearly'
+        
+        // Calculate date range based on filter
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        let dateStart = null;
+        let dateEnd = null;
+        
+        switch (filter) {
+            case 'daily':
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'weekly':
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 6);
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'monthly':
+                // Last 30 days: from 30 days ago to start of tomorrow
+                dateStart = new Date(today);
+                dateStart.setDate(dateStart.getDate() - 29); // 30 days including today
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+                break;
+            case 'yearly':
+                dateStart = new Date(now.getFullYear(), 0, 1);
+                dateEnd = new Date(now.getFullYear() + 1, 0, 1);
+                break;
+            default:
+                dateStart = today;
+                dateEnd = new Date(today);
+                dateEnd.setDate(dateEnd.getDate() + 1);
+        }
+        
+        // Format dates for MySQL (YYYY-MM-DD HH:MM:SS)
+        const formatDateTime = (date) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day} 00:00:00`;
+        };
+        
+        const startStr = formatDateTime(dateStart);
+        const endStr = formatDateTime(dateEnd);
+        
+        const [rows] = await db.execute(`
+            SELECT 
+                r.id,
+                r.trip_id,
+                t.trip_no,
+                r.ClientID,
+                c.name as client_name,
+                r.Amount,
+                r.Date as recovery_date,
+                COALESCE(tr.PaymentMode, r.Payment_Head, 'N/A') as PaymentMethod,
+                r.transactionID,
+                tr.AccountID,
+                a.AccountTitle as account_name,
+                r.CD as created_date
+            FROM recoveries r
+            LEFT JOIN trips t ON t.id = r.trip_id AND t.active = 1
+            LEFT JOIN customers c ON c.id = r.ClientID AND c.active = 1
+            LEFT JOIN transactions tr ON tr.ID = r.transactionID AND tr.active = 1
+            LEFT JOIN accounts a ON a.ID = tr.AccountID AND a.active = 1
+            WHERE r.Active = 1
+              AND r.CD >= ? AND r.CD < ?
+            ORDER BY r.CD DESC
+        `, [startStr, endStr]);
+        
+        res.json(rows || []);
+    } catch (err) {
+        console.error('Error fetching recoveries:', err);
+        res.status(500).json({ message: 'Error fetching recoveries', error: err.message });
     }
 };
 

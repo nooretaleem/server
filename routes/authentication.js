@@ -37,8 +37,20 @@ router.get('/getDashboardData', projectController.getDashboardData);
 router.get('/getPendingTrips', projectController.getPendingTrips);
 router.get('/getCreditTrips', projectController.getCreditTrips);
 router.get('/getDealerPayables', projectController.getDealerPayables);
+router.get('/getFilteredDealerPayables', projectController.getFilteredDealerPayables);
 router.get('/getClientDues', projectController.getClientDues);
+router.get('/getFilteredClientDue', projectController.getFilteredClientDue);
 router.get('/getExpenditureBreakdown', projectController.getExpenditureBreakdown);
+router.get('/getFilteredExpenditure', projectController.getFilteredExpenditure);
+router.get('/getFilteredTripsCount', projectController.getFilteredTripsCount);
+router.get('/getFilteredFuelPurchased', projectController.getFilteredFuelPurchased);
+router.get('/getFilteredFuelSold', projectController.getFilteredFuelSold);
+router.get('/getFilteredRentPaid', projectController.getFilteredRentPaid);
+router.get('/getFilteredPayments', projectController.getFilteredPayments);
+router.get('/getFilteredRecoveries', projectController.getFilteredRecoveries);
+router.get('/getTodayRentPayments', projectController.getTodayRentPayments);
+router.get('/getTodayDealerPayments', projectController.getTodayDealerPayments);
+router.get('/getTodayRecoveries', projectController.getTodayRecoveries);
 
 // Trips
 router.get('/getTrips', tripsController.getTrips);
@@ -59,6 +71,7 @@ router.delete('/deleteLicenseHolder', tripsController.deleteLicenseHolder);
 router.get('/getSoldFuelForTrip', tripsController.getSoldFuelForTrip);
 router.get('/getTripDistribution', tripsController.getTripDistribution);
 router.get('/getTodayPolSales', tripsController.getTodayPolSales);
+router.get('/getFilteredPolSales', tripsController.getFilteredPolSales);
 router.get('/getTripProducts', tripsController.getTripProducts);
 router.get('/getTripProductDetails', tripsController.getTripProductDetails);
 router.post('/addSale', tripsController.addSale);
