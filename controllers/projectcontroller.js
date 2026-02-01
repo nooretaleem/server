@@ -2461,23 +2461,81 @@ exports.getCustomersReport = async (req, res) => {
             return res.status(400).json({ error: 'Start date and end date are required' });
         }
 
+        // Use subqueries to avoid Cartesian product when joining sales and recoveries
         const [customerRows] = await db.execute(`
             SELECT 
                 c.id as client_id,
                 c.name as client_name,
-                COALESCE(SUM(CASE WHEN ps.Active = 1 AND DATE(ps.date) >= ? AND DATE(ps.date) <= ? THEN ps.total_amount ELSE 0 END), 0) as total_sales,
-                COALESCE(SUM(CASE WHEN ps.Active = 1 AND DATE(ps.date) >= ? AND DATE(ps.date) <= ? THEN ps.fuel ELSE 0 END), 0) as total_fuel,
-                COALESCE(SUM(CASE WHEN r.Active = 1 AND DATE(r.Date) >= ? AND DATE(r.Date) <= ? THEN r.Amount ELSE 0 END), 0) as total_recoveries,
-                (COALESCE(SUM(CASE WHEN ps.Active = 1 AND DATE(ps.date) >= ? AND DATE(ps.date) <= ? THEN ps.total_amount ELSE 0 END), 0) - 
-                 COALESCE(SUM(CASE WHEN r.Active = 1 AND DATE(r.Date) >= ? AND DATE(r.Date) <= ? THEN r.Amount ELSE 0 END), 0)) as due_amount
+                COALESCE((
+                    SELECT IFNULL(SUM(ps.total_amount), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                        AND ps.Active = 1 
+                        AND DATE(ps.date) >= ? 
+                        AND DATE(ps.date) <= ?
+                ), 0) as total_sales,
+                COALESCE((
+                    SELECT IFNULL(SUM(ps.fuel), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                        AND ps.Active = 1 
+                        AND DATE(ps.date) >= ? 
+                        AND DATE(ps.date) <= ?
+                ), 0) as total_fuel,
+                COALESCE((
+                    SELECT IFNULL(SUM(r.Amount), 0)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                        AND r.Active = 1 
+                        AND DATE(r.Date) >= ? 
+                        AND DATE(r.Date) <= ?
+                ), 0) as total_recoveries,
+                (COALESCE((
+                    SELECT IFNULL(SUM(ps.total_amount), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                        AND ps.Active = 1 
+                        AND DATE(ps.date) >= ? 
+                        AND DATE(ps.date) <= ?
+                ), 0) - 
+                COALESCE((
+                    SELECT IFNULL(SUM(r.Amount), 0)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                        AND r.Active = 1 
+                        AND DATE(r.Date) >= ? 
+                        AND DATE(r.Date) <= ?
+                ), 0)) as due_amount
             FROM customers c
-            LEFT JOIN pol_sale ps ON ps.client_id = c.id AND ps.Active = 1
-            LEFT JOIN recoveries r ON r.ClientID = c.id AND r.Active = 1
             WHERE c.active = 1
-            GROUP BY c.id, c.name
-            HAVING total_sales > 0 OR total_recoveries > 0
+            HAVING (
+                COALESCE((
+                    SELECT IFNULL(SUM(ps.total_amount), 0)
+                    FROM pol_sale ps
+                    WHERE ps.client_id = c.id 
+                        AND ps.Active = 1 
+                        AND DATE(ps.date) >= ? 
+                        AND DATE(ps.date) <= ?
+                ), 0) > 0 OR
+                COALESCE((
+                    SELECT IFNULL(SUM(r.Amount), 0)
+                    FROM recoveries r
+                    WHERE r.ClientID = c.id 
+                        AND r.Active = 1 
+                        AND DATE(r.Date) >= ? 
+                        AND DATE(r.Date) <= ?
+                ), 0) > 0
+            )
             ORDER BY due_amount DESC
-        `, [startDate, endDate, startDate, endDate, startDate, endDate, startDate, endDate, startDate, endDate]);
+        `, [
+            startDate, endDate,  // total_sales
+            startDate, endDate,  // total_fuel
+            startDate, endDate,  // total_recoveries
+            startDate, endDate,  // due_amount sales
+            startDate, endDate,  // due_amount recoveries
+            startDate, endDate,  // HAVING sales
+            startDate, endDate   // HAVING recoveries
+        ]);
 
         res.json(customerRows);
     } catch (err) {

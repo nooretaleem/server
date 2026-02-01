@@ -5,19 +5,41 @@ exports.getCustomers = async (req, res) => {
     try {
         const query = `
             SELECT 
-                id,
-                name,
-                phone,
-                address,
-                active,
-                CD,
-                CB,
-                MD
-            FROM customers
-            WHERE active = 1
-            ORDER BY name
+                c.id,
+                c.name,
+                c.phone,
+                c.address,
+                c.active,
+                c.CD,
+                c.CB,
+                c.MD,
+                COALESCE(sales.total_purchased_fuel_ltrs, 0) as total_purchased_fuel_ltrs,
+                COALESCE(sales.total_amount, 0) as total_sales,
+                COALESCE(recoveries.total_paid, 0) as total_paid,
+                GREATEST(0, COALESCE(sales.total_amount, 0) - COALESCE(recoveries.total_paid, 0)) as customer_dues
+            FROM customers c
+            LEFT JOIN (
+                SELECT 
+                    client_id,
+                    SUM(fuel) AS total_purchased_fuel_ltrs,
+                    SUM(total_amount) AS total_amount
+                FROM pol_sale
+                WHERE Active = 1
+                GROUP BY client_id
+            ) sales ON c.id = sales.client_id
+            LEFT JOIN (
+                SELECT 
+                    ClientID,
+                    SUM(Amount) AS total_paid
+                FROM recoveries
+                WHERE Active = 1
+                GROUP BY ClientID
+            ) recoveries ON c.id = recoveries.ClientID
+            WHERE c.active = 1
+            ORDER BY c.name
         `;
         const [rows] = await db.execute(query);
+        console.log(`[getCustomers] Returning ${rows.length} customers`);
         res.json(rows);
     } catch (err) {
         console.error('Error fetching customers:', err);
