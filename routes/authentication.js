@@ -250,5 +250,6 @@ router.delete('/deleteDailySalesSummary', dailySalesSummaryController.deleteDail
 router.get('/getPurchaseReport', projectController.getPurchaseReport);
 router.get('/getSaleReport', projectController.getSaleReport);
 router.get('/getCustomersReport', projectController.getCustomersReport);
+router.get('/getCustomerIndividualReport', projectController.getCustomerIndividualReport);
 
 module.exports = router;

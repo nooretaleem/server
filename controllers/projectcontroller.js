@@ -2543,6 +2543,117 @@ exports.getCustomersReport = async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch customers report' });
     }
 };
+
+// Get individual customer report with fuel purchases and recoveries
+exports.getCustomerIndividualReport = async (req, res) => {
+    try {
+        const clientId = req.query.clientId || null;
+        const startDate = req.query.startDate || null;
+        const endDate = req.query.endDate || null;
+
+        if (!clientId) {
+            return res.status(400).json({ error: 'Customer ID is required' });
+        }
+
+        if (!startDate || !endDate) {
+            return res.status(400).json({ error: 'Start date and end date are required' });
+        }
+
+        // Get customer information
+        const [customerRows] = await db.execute(
+            'SELECT id, name, phone, address FROM customers WHERE id = ? AND active = 1',
+            [clientId]
+        );
+
+        if (customerRows.length === 0) {
+            return res.status(404).json({ error: 'Customer not found' });
+        }
+
+        const customer = customerRows[0];
+
+        // Get fuel purchases (POL Sales) for the customer within date range
+        const [purchaseRows] = await db.execute(`
+            SELECT 
+                ps.id,
+                ps.date,
+                ps.fuel,
+                ps.rate,
+                ps.Discount,
+                ps.total_amount,
+                ps.container_type,
+                t.trip_no,
+                tp.product_type,
+                d.name as depo_name
+            FROM pol_sale ps
+            LEFT JOIN trips t ON ps.trip_id = t.id AND t.active = 1
+            LEFT JOIN trip_products tp ON ps.trip_product_id = tp.id AND tp.Active = 1
+            LEFT JOIN trip_depos td ON ps.trip_id = td.trip_id 
+                AND ps.trip_product_id = td.product_id 
+                AND td.Active = 1
+            LEFT JOIN depo d ON td.depo_id = d.id AND d.active = 1
+            WHERE ps.client_id = ? 
+                AND ps.Active = 1 
+                AND DATE(ps.date) >= ? 
+                AND DATE(ps.date) <= ?
+            ORDER BY ps.date DESC, ps.id DESC
+        `, [clientId, startDate, endDate]);
+
+        // Get recoveries (payments) for the customer within date range
+        const [recoveryRows] = await db.execute(`
+            SELECT 
+                r.ID,
+                r.transactionID,
+                r.Amount,
+                r.Payment_Head,
+                r.Date,
+                t.AccountID,
+                t.cash_in_hand_id,
+                d.name as depo_name
+            FROM recoveries r
+            LEFT JOIN transactions t ON r.transactionID = t.ID
+            LEFT JOIN settlements s ON r.ID = s.recovery_id AND s.Active = 1
+            LEFT JOIN depo d ON s.depo_id = d.id AND d.active = 1
+            WHERE r.ClientID = ? 
+                AND r.Active = 1 
+                AND DATE(r.Date) >= ? 
+                AND DATE(r.Date) <= ?
+            ORDER BY r.Date DESC, r.ID DESC
+        `, [clientId, startDate, endDate]);
+
+        // Calculate totals
+        const totalPurchases = purchaseRows.reduce((sum, row) => sum + parseFloat(row.total_amount || 0), 0);
+        const totalFuel = purchaseRows.reduce((sum, row) => sum + parseFloat(row.fuel || 0), 0);
+        const totalRecoveries = recoveryRows.reduce((sum, row) => sum + parseFloat(row.Amount || 0), 0);
+        const totalDue = totalPurchases - totalRecoveries;
+
+        res.json({
+            customer: {
+                id: customer.id,
+                name: customer.name,
+                phone: customer.phone || 'N/A',
+                address: customer.address || 'N/A'
+            },
+            purchases: purchaseRows,
+            recoveries: recoveryRows,
+            summary: {
+                totalPurchases: totalPurchases,
+                totalFuel: totalFuel,
+                totalRecoveries: totalRecoveries,
+                totalDue: totalDue,
+                purchaseCount: purchaseRows.length,
+                recoveryCount: recoveryRows.length
+            },
+            dateRange: {
+                startDate: startDate,
+                endDate: endDate
+            }
+        });
+    } catch (err) {
+        console.error('Error fetching customer individual report:', err);
+        res.status(500).json({ error: 'Failed to fetch customer individual report' });
+    }
+};
+
 //Dashboard Functions
 
 exports.addProject = async (req, res) => {
