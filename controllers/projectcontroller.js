@@ -1159,7 +1159,20 @@ exports.getFilteredDealerPayables = async (req, res) => {
               ${tripDateRange}
         `);
         
-        const totalPayableToDealers = parseFloat(payableRows[0]?.total_remaining || 0);
+        const tripPayableAmount = parseFloat(payableRows[0]?.total_remaining || 0);
+        
+        // Get total previous_payables from all active dealers
+        // previous_payables is an opening balance, so it should be included in all time periods
+        const [previousPayablesRows] = await db.execute(`
+            SELECT COALESCE(SUM(previous_payables), 0) as total_previous_payables
+            FROM depo
+            WHERE active = 1
+        `);
+        
+        const totalPreviousPayables = parseFloat(previousPayablesRows[0]?.total_previous_payables || 0);
+        
+        // Total payable = previous_payables + trip payables
+        const totalPayableToDealers = totalPreviousPayables + tripPayableAmount;
         
         // Format date for display
         const formatDateForDisplay = (date) => {
@@ -1261,8 +1274,9 @@ exports.getDealerPayables = async (req, res) => {
             SELECT 
                 d.id as depo_id,
                 d.name as depo_name,
+                d.previous_payables,
                 c.name as company_name,
-                COALESCE(SUM(td.payable_amount - COALESCE(td.paid_amount, 0)), 0) as payable_amount
+                COALESCE(SUM(td.payable_amount - COALESCE(td.paid_amount, 0)), 0) as trip_payable_amount
             FROM depo d
             LEFT JOIN depo_company dc ON dc.depo_id = d.id AND dc.active = 1
             LEFT JOIN company c ON c.id = dc.company_id AND c.active = 1
@@ -1272,16 +1286,23 @@ exports.getDealerPayables = async (req, res) => {
                 AND td.purchase_type != 'cash'
                 ${payableCondition}
             WHERE d.active = 1
-            GROUP BY d.id, d.name, c.name
-            HAVING payable_amount > 0
-            ORDER BY payable_amount DESC
+            GROUP BY d.id, d.name, d.previous_payables, c.name
+            HAVING (COALESCE(d.previous_payables, 0) + COALESCE(SUM(td.payable_amount - COALESCE(td.paid_amount, 0)), 0)) > 0
+            ORDER BY (COALESCE(d.previous_payables, 0) + COALESCE(SUM(td.payable_amount - COALESCE(td.paid_amount, 0)), 0)) DESC
         `);
 
         const dealerPayables = [];
 
         for (const row of dealerPayablesRows) {
             const depoId = row.depo_id;
-            const payableAmount = parseFloat(row.payable_amount || 0);
+            const previousPayables = parseFloat(row.previous_payables || 0) || 0;
+            const tripPayableAmount = parseFloat(row.trip_payable_amount || 0);
+            // Total payable = previous_payables + trip payables
+            // Since payments are applied to previous_payables first, then to trips,
+            // we need to calculate: previous_payables + (trip payables - payments applied to trips)
+            // But since we don't track which payments went where, we use:
+            // Total payable = current previous_payables + trip payables
+            const payableAmount = previousPayables + tripPayableAmount;
 
             // Get starting credit (InitialLimit from pool table)
             const [initialLimitRows] = await db.execute(`
@@ -1325,10 +1346,12 @@ exports.getDealerPayables = async (req, res) => {
                 depo_id: depoId,
                 depo_name: row.depo_name,
                 company_name: row.company_name || 'N/A',
+                previous_payables: previousPayables,
+                trip_payables: tripPayableAmount, // Separate trips payables
                 starting_credit: startingCredit,
                 current_balance: currentBalance,
                 available_credit: availableCredit,
-                payable_amount: payableAmount
+                payable_amount: payableAmount // Total = previous_payables + trip_payables
             });
         }
 
@@ -2395,7 +2418,8 @@ exports.getPurchaseReport = async (req, res) => {
                 tp.invoice_rate as rate,
                 tp.discount,
                 td.payable_amount as total_amount,
-                COALESCE(td.paid_amount, 0) as paid
+                COALESCE(td.paid_amount, 0) as paid,
+                COALESCE(d.previous_payables, 0) as previous_payables
             FROM trip_depos td
             INNER JOIN trips t ON td.trip_id = t.id AND t.active = 1
             INNER JOIN trip_products tp ON td.product_id = tp.id AND tp.active = 1

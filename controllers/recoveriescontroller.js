@@ -303,30 +303,90 @@ exports.addRecovery = async (req, res) => {
         try {
             await connection.beginTransaction();
 
+            // STEP 1: First, deduct from Previous_Dues in customers table
+            // Get customer's current Previous_Dues
+            const [customerRows] = await connection.execute(
+                'SELECT Previous_Dues FROM customers WHERE id = ? AND active = 1',
+                [ClientID]
+            );
+
+            if (customerRows.length === 0) {
+                await connection.rollback();
+                connection.release();
+                return res.status(404).json({ message: 'Customer not found or inactive' });
+            }
+
+            const currentPreviousDues = parseFloat(customerRows[0].Previous_Dues || 0) || 0;
+            const recoveryAmount = parseFloat(Amount);
+            let remainingRecoveryAmount = recoveryAmount;
+            let amountDeductedFromPreviousDues = 0;
+
+            // Deduct from Previous_Dues first
+            if (currentPreviousDues > 0 && remainingRecoveryAmount > 0) {
+                if (remainingRecoveryAmount <= currentPreviousDues) {
+                    // Recovery amount is less than or equal to Previous_Dues
+                    // Deduct all recovery amount from Previous_Dues
+                    amountDeductedFromPreviousDues = remainingRecoveryAmount;
+                    const newPreviousDues = currentPreviousDues - remainingRecoveryAmount;
+                    
+                    await connection.execute(
+                        'UPDATE customers SET Previous_Dues = ?, MD = NOW() WHERE id = ?',
+                        [newPreviousDues, ClientID]
+                    );
+                    
+                    remainingRecoveryAmount = 0; // No amount left for POL Sale dues
+                    console.log(`Deducted ${amountDeductedFromPreviousDues} from Previous_Dues for customer ${ClientID}. New Previous_Dues: ${newPreviousDues}`);
+                } else {
+                    // Recovery amount exceeds Previous_Dues
+                    // Deduct all Previous_Dues (set to 0)
+                    amountDeductedFromPreviousDues = currentPreviousDues;
+                    remainingRecoveryAmount = remainingRecoveryAmount - currentPreviousDues;
+                    
+                    await connection.execute(
+                        'UPDATE customers SET Previous_Dues = 0, MD = NOW() WHERE id = ?',
+                        [ClientID]
+                    );
+                    
+                    console.log(`Deducted all Previous_Dues (${amountDeductedFromPreviousDues}) for customer ${ClientID}. Remaining recovery amount: ${remainingRecoveryAmount}`);
+                }
+            }
+
+            // If no amount remains after deducting from Previous_Dues, skip POL Sale dues processing
+            // But still need to process the payment method (account/depo/cash_in_hand) for transaction records
+            // So we'll continue with the payment processing, but skip trip amount_collected updates if remainingRecoveryAmount is 0
+
             let transactionID = null;
             let settlementId = null;
             let amountToAdvanceBalance = 0; // For depo payments: amount to credit to advance_balance after pool is recovered
             let depoIdForAdvanceBalance = null; // DepoID for advance_balance credit
 
             // Find trips for this client with remaining balance (FIFO) - BEFORE any payment processing
+            // Only if there's remaining recovery amount after Previous_Dues deduction
             // This is done for ALL payment methods to get trip_id for transaction and recovery records
-            const [clientTripsWithBalance] = await connection.execute(
-                `SELECT t.id, t.amount_collected, t.total_amount,
-                 (COALESCE(t.total_amount, 0) - COALESCE(t.amount_collected, 0)) as remaining
-                 FROM trips t
-                 INNER JOIN pol_sale ps ON t.id = ps.trip_id AND ps.Active = 1
-                 WHERE ps.client_id = ?
-                 AND t.status != 'Cancelled'
-                 AND t.active = 1
-                 AND (COALESCE(t.total_amount, 0) - COALESCE(t.amount_collected, 0)) > 0
-                 ORDER BY t.start_date ASC, t.id ASC`,
-                [ClientID]
-            );
-
-            // Get TripID from oldest trip with remaining balance (FIFO)
+            let clientTripsWithBalance = [];
             let tripIdForTransaction = null;
-            if (clientTripsWithBalance.length > 0) {
-                tripIdForTransaction = clientTripsWithBalance[0].id;
+            
+            if (remainingRecoveryAmount > 0) {
+                // Only query trips if there's remaining amount to apply to POL Sale dues
+                const [tripsResult] = await connection.execute(
+                    `SELECT t.id, t.amount_collected, t.total_amount,
+                     (COALESCE(t.total_amount, 0) - COALESCE(t.amount_collected, 0)) as remaining
+                     FROM trips t
+                     INNER JOIN pol_sale ps ON t.id = ps.trip_id AND ps.Active = 1
+                     WHERE ps.client_id = ?
+                     AND t.status != 'Cancelled'
+                     AND t.active = 1
+                     AND (COALESCE(t.total_amount, 0) - COALESCE(t.amount_collected, 0)) > 0
+                     ORDER BY t.start_date ASC, t.id ASC`,
+                    [ClientID]
+                );
+                
+                clientTripsWithBalance = tripsResult;
+
+                // Get TripID from oldest trip with remaining balance (FIFO)
+                if (clientTripsWithBalance.length > 0) {
+                    tripIdForTransaction = clientTripsWithBalance[0].id;
+                }
             }
 
             // Handle different payment methods
@@ -697,34 +757,34 @@ exports.addRecovery = async (req, res) => {
                 // based on the initial balance limit. No need to add again here.
 
                 // 4b. Also update CLIENT's trips amount_collected (for customer due calculation)
-                // Use the client trips found earlier
-                let remainingRecoveryAmount = parseFloat(Amount);
-                
-                // Apply amount to client's trips' amount_collected in order (oldest first)
-                for (const trip of clientTripsWithBalance) {
-                    if (remainingRecoveryAmount <= 0) break;
-                    
-                    const totalAmount = parseFloat(trip.total_amount) || 0;
-                    const currentCollected = parseFloat(trip.amount_collected) || 0;
-                    const remaining = parseFloat(trip.remaining) || 0;
-                    
-                    if (remaining > 0) {
-                        // Calculate how much to apply to this trip
-                        const amountToApply = Math.min(remainingRecoveryAmount, remaining);
-                        const newCollected = currentCollected + amountToApply;
+                // Use the remainingRecoveryAmount after Previous_Dues deduction
+                // Apply remaining amount to client's trips' amount_collected in order (oldest first)
+                if (remainingRecoveryAmount > 0 && clientTripsWithBalance.length > 0) {
+                    for (const trip of clientTripsWithBalance) {
+                        if (remainingRecoveryAmount <= 0) break;
                         
-                        // Update trip's amount_collected
-                        await connection.execute(
-                            `UPDATE trips 
-                             SET amount_collected = ?,
-                                 MD = NOW()
-                             WHERE id = ?`,
-                            [newCollected, trip.id]
-                        );
+                        const totalAmount = parseFloat(trip.total_amount) || 0;
+                        const currentCollected = parseFloat(trip.amount_collected) || 0;
+                        const remaining = parseFloat(trip.remaining) || 0;
                         
-                        remainingRecoveryAmount -= amountToApply;
-                        
-                        console.log(`Applied ${amountToApply} to client trip ${trip.id} collected. New collected: ${newCollected}`);
+                        if (remaining > 0) {
+                            // Calculate how much to apply to this trip
+                            const amountToApply = Math.min(remainingRecoveryAmount, remaining);
+                            const newCollected = currentCollected + amountToApply;
+                            
+                            // Update trip's amount_collected
+                            await connection.execute(
+                                `UPDATE trips 
+                                 SET amount_collected = ?,
+                                     MD = NOW()
+                                 WHERE id = ?`,
+                                [newCollected, trip.id]
+                            );
+                            
+                            remainingRecoveryAmount -= amountToApply;
+                            
+                            console.log(`Applied ${amountToApply} to client trip ${trip.id} collected. New collected: ${newCollected}`);
+                        }
                     }
                 }
 
@@ -801,15 +861,14 @@ exports.addRecovery = async (req, res) => {
             const tripIdForRecovery = tripIdForTransaction;
 
             // Update trips amount_collected for Own Account and Cash in Hand payments
-            if (payment_method === 'account' || payment_method === 'cash_in_hand') {
+            // Use remainingRecoveryAmount (after Previous_Dues deduction)
+            if ((payment_method === 'account' || payment_method === 'cash_in_hand') && remainingRecoveryAmount > 0) {
                 // Use the trips found above
                 const clientTrips = clientTripsWithBalance;
-
-                let remainingAmount = parseFloat(Amount);
                 
-                // Apply amount to trips' amount_collected in order (oldest first)
+                // Apply remaining amount to trips' amount_collected in order (oldest first)
                 for (const trip of clientTrips) {
-                    if (remainingAmount <= 0) break;
+                    if (remainingRecoveryAmount <= 0) break;
                     
                     const totalAmount = parseFloat(trip.total_amount) || 0;
                     const currentCollected = parseFloat(trip.amount_collected) || 0;
@@ -817,7 +876,7 @@ exports.addRecovery = async (req, res) => {
                     
                     if (remaining > 0) {
                         // Calculate how much to apply to this trip
-                        const amountToApply = Math.min(remainingAmount, remaining);
+                        const amountToApply = Math.min(remainingRecoveryAmount, remaining);
                         const newCollected = currentCollected + amountToApply;
                         
                         // Update trip's amount_collected
@@ -829,7 +888,7 @@ exports.addRecovery = async (req, res) => {
                             [newCollected, trip.id]
                         );
                         
-                        remainingAmount -= amountToApply;
+                        remainingRecoveryAmount -= amountToApply;
                         
                         console.log(`Applied ${amountToApply} to trip ${trip.id} collected. New collected: ${newCollected}`);
                     }
@@ -1006,6 +1065,31 @@ exports.deleteRecovery = async (req, res) => {
             const amount = parseFloat(recovery.Amount || 0);
             const recoveryDate = recovery.Date;
             const tripId = recovery.trip_id || recovery.transaction_trip_id;
+            const clientId = recovery.ClientID;
+
+            // Step 1a: Reverse Previous_Dues deduction
+            // When a recovery is deleted, we need to restore the amount that was deducted from Previous_Dues
+            // Since recoveries are applied to Previous_Dues FIRST (before POL Sale dues), we restore the full recovery amount
+            // Note: This might slightly over-restore if the recovery was split between Previous_Dues and trips,
+            // but it's safer than under-restoring. The trip amount_collected will be reversed separately below.
+            const [customerRows] = await connection.execute(
+                'SELECT Previous_Dues FROM customers WHERE id = ? AND active = 1',
+                [clientId]
+            );
+
+            if (customerRows.length > 0) {
+                const currentPreviousDues = parseFloat(customerRows[0].Previous_Dues || 0) || 0;
+                // Restore the full recovery amount to Previous_Dues
+                // (The recovery was deducted from Previous_Dues first, then any remainder went to trips)
+                const restoredPreviousDues = currentPreviousDues + amount;
+                
+                await connection.execute(
+                    'UPDATE customers SET Previous_Dues = ?, MD = NOW() WHERE id = ?',
+                    [restoredPreviousDues, clientId]
+                );
+                
+                console.log(`Restored ${amount} to Previous_Dues for customer ${clientId}. New Previous_Dues: ${restoredPreviousDues}`);
+            }
             
             // Determine payment method from transaction data
             let paymentMethod = null;

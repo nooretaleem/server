@@ -9,6 +9,7 @@ exports.getCustomers = async (req, res) => {
                 c.name,
                 c.phone,
                 c.address,
+                c.Previous_Dues,
                 c.active,
                 c.CD,
                 c.CB,
@@ -16,7 +17,24 @@ exports.getCustomers = async (req, res) => {
                 COALESCE(sales.total_purchased_fuel_ltrs, 0) as total_purchased_fuel_ltrs,
                 COALESCE(sales.total_amount, 0) as total_sales,
                 COALESCE(recoveries.total_paid, 0) as total_paid,
-                GREATEST(0, COALESCE(sales.total_amount, 0) - COALESCE(recoveries.total_paid, 0)) as customer_dues
+                -- Calculate customer dues correctly:
+                -- Since recoveries are applied to Previous_Dues FIRST, then to POL Sale:
+                -- The correct formula is: Current Previous_Dues + (POL Sale Amount - Recoveries Applied to POL Sale)
+                -- To calculate "Recoveries Applied to POL Sale", we need to know how much went to Previous_Dues.
+                -- Since we don't track original Previous_Dues, we use this logic:
+                -- If Current Previous_Dues >= Total Recoveries: All recoveries went to Previous_Dues, so POL Sale Dues = Sales
+                -- If Current Previous_Dues < Total Recoveries: (Total Recoveries - Current Previous_Dues) went to POL Sale
+                -- But this assumes Current Previous_Dues represents what's left after recoveries, which is correct.
+                -- So: Recoveries Applied to POL Sale = GREATEST(0, Total Recoveries - Current Previous_Dues)
+                -- POL Sale Dues = Sales - Recoveries Applied to POL Sale
+                -- Total Dues = Current Previous_Dues + POL Sale Dues
+                (
+                    COALESCE(c.Previous_Dues, 0) + 
+                    GREATEST(0, 
+                        COALESCE(sales.total_amount, 0) - 
+                        GREATEST(0, COALESCE(recoveries.total_paid, 0) - COALESCE(c.Previous_Dues, 0))
+                    )
+                ) as customer_dues
             FROM customers c
             LEFT JOIN (
                 SELECT 
@@ -59,7 +77,7 @@ exports.getCustomer = async (req, res) => {
             return res.status(400).json({ message: 'Customer ID is required' });
         }
 
-        const query = 'SELECT id, name, phone, address, active, CD, CB, MD FROM customers WHERE id = ? AND active = 1';
+        const query = 'SELECT id, name, phone, address, Previous_Dues, active, CD, CB, MD FROM customers WHERE id = ? AND active = 1';
         const [rows] = await db.execute(query, [id]);
         
         if (rows.length === 0) {
@@ -79,7 +97,8 @@ exports.addCustomer = async (req, res) => {
         const {
             name,
             phone,
-            address
+            address,
+            Previous_Dues
         } = req.body;
 
         if (!name) {
@@ -88,16 +107,19 @@ exports.addCustomer = async (req, res) => {
 
         // Get CB (Created By) from request body, default to 'System' if not provided
         const CB = req.body.CB || 'System';
+        // Get Previous_Dues, default to 0 if not provided
+        const previousDues = parseFloat(Previous_Dues || 0) || 0;
 
         const query = `
-            INSERT INTO customers (name, phone, address, active, CB, CD, MD) 
-            VALUES (?, ?, ?, 1, ?, NOW(), NOW())
+            INSERT INTO customers (name, phone, address, Previous_Dues, active, CB, CD, MD) 
+            VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())
         `;
 
         const [result] = await db.execute(query, [
             name,
             phone || null,
             address || null,
+            previousDues,
             CB
         ]);
 
@@ -123,6 +145,7 @@ exports.updateCustomer = async (req, res) => {
             name,
             phone,
             address,
+            Previous_Dues,
             is_active,
             active
         } = req.body;
@@ -136,12 +159,15 @@ exports.updateCustomer = async (req, res) => {
 
         // Handle both 'is_active' (from frontend) and 'active' (direct)
         const activeValue = is_active !== undefined ? is_active : (active !== undefined ? active : 1);
+        // Get Previous_Dues, default to 0 if not provided
+        const previousDues = parseFloat(Previous_Dues || 0) || 0;
 
         const query = `
             UPDATE customers SET 
                 name = ?,
                 phone = ?,
                 address = ?,
+                Previous_Dues = ?,
                 active = ?,
                 MD = NOW()
             WHERE id = ?
@@ -151,6 +177,7 @@ exports.updateCustomer = async (req, res) => {
             name,
             phone || null,
             address || null,
+            previousDues,
             activeValue ? 1 : 0,
             id
         ]);
@@ -366,7 +393,15 @@ exports.getCustomersDueAmounts = async (req, res) => {
   COALESCE(sales.total_amount, 0) AS amount,
   COALESCE(recoveries.total_paid, 0) AS paid,
 
-  (COALESCE(sales.total_amount, 0) - COALESCE(recoveries.total_paid, 0)) AS due
+  -- Calculate dues correctly: Current Previous_Dues + (POL Sale - Recoveries Applied to POL Sale)
+  -- Recoveries Applied to POL Sale = MAX(0, Total Recoveries - Current Previous_Dues)
+  (
+    COALESCE(c.Previous_Dues, 0) + 
+    GREATEST(0, 
+      COALESCE(sales.total_amount, 0) - 
+      GREATEST(0, COALESCE(recoveries.total_paid, 0) - COALESCE(c.Previous_Dues, 0))
+    )
+  ) AS due
 
 FROM customers c
 

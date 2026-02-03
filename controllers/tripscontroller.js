@@ -2478,9 +2478,9 @@ exports.getDepoRemainingAmount = async (req, res) => {
             return res.status(400).json({ message: 'Depo ID is required' });
         }
 
-        // Get depo info (Balance comes from depo table; advance comes from advance_balance table)
+        // Get depo info (Balance and previous_payables come from depo table; advance comes from advance_balance table)
         const [depoRows] = await db.execute(
-            `SELECT Balance FROM depo WHERE id = ? AND active = 1`,
+            `SELECT Balance, previous_payables FROM depo WHERE id = ? AND active = 1`,
             [depoId]
         );
         
@@ -2489,6 +2489,7 @@ exports.getDepoRemainingAmount = async (req, res) => {
         }
         
         const depoBalance = parseFloat(depoRows[0].Balance || 0);
+        const previousPayables = parseFloat(depoRows[0].previous_payables || 0) || 0;
         
         // Advance balance is stored in advance_balance table (latest Balance)
         const [advanceRows] = await db.execute(
@@ -2535,17 +2536,24 @@ exports.getDepoRemainingAmount = async (req, res) => {
             [depoId]
         );
         
-        const remainingAmount = parseFloat(remainingBalanceRows[0]?.remaining_balance || 0);
+        const tripRemainingAmount = parseFloat(remainingBalanceRows[0]?.remaining_balance || 0);
+        
+        // Total remaining amount = previous_payables + trip payables
+        // Since payments are applied to previous_payables first, then to trips,
+        // the total payable is: current previous_payables + trip payables
+        const remainingAmount = previousPayables + tripRemainingAmount;
         
         // Total available funds for new product purchases:
         // - credit side: currentPoolLimit
         // - advance side: advanceBalance
         const totalAvailable = advanceBalance + currentPoolLimit;
         
-        console.log(`Depo ${depoId}: RemainingAmount=${remainingAmount}, AdvanceBalance=${advanceBalance}, CreditBalance=${currentPoolLimit}, TotalAvailable=${totalAvailable}`);
+        console.log(`Depo ${depoId}: PreviousPayables=${previousPayables}, TripRemainingAmount=${tripRemainingAmount}, TotalRemainingAmount=${remainingAmount}, AdvanceBalance=${advanceBalance}, CreditBalance=${currentPoolLimit}, TotalAvailable=${totalAvailable}`);
         
         res.json({ 
             remainingAmount: remainingAmount,
+            previousPayables: previousPayables,
+            tripRemainingAmount: tripRemainingAmount,
             advanceBalance: advanceBalance,
             // IMPORTANT: This is the "current credit limit" (latest pool DepoLimit), matching Pool History UI
             creditBalance: currentPoolLimit,

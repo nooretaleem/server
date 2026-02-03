@@ -13,6 +13,7 @@ exports.getDepos = async (req, res) => {
                 d.phone_no,
                 d.address,
                 d.Balance,
+                d.previous_payables,
                 (
                     SELECT COALESCE(ab.Balance, 0)
                     FROM advance_balance ab
@@ -86,6 +87,7 @@ exports.getDepo = async (req, res) => {
         const query = `
             SELECT 
                 d.*,
+                d.previous_payables,
                 dc.company_id
             FROM depo d
             LEFT JOIN depo_company dc ON d.id = dc.depo_id AND dc.active = 1
@@ -124,6 +126,7 @@ exports.addDepo = async (req, res) => {
             phone_no,
             address,
             Balance,
+            previous_payables,
             company_id
         } = req.body;
 
@@ -192,10 +195,13 @@ exports.addDepo = async (req, res) => {
 
         await connection.beginTransaction();
 
+        // Get previous_payables, default to 0 if not provided
+        const previousPayables = parseFloat(previous_payables || 0) || 0;
+
         // Insert into depo table with CB, CD, MD, active
         const depoQuery = `
-            INSERT INTO depo (name, code,phone_no, address, Balance, CB, CD, MD, active) 
-            VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)
+            INSERT INTO depo (name, code,phone_no, address, Balance, previous_payables, CB, CD, MD, active) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)
         `;
 
         const [depoResult] = await connection.execute(depoQuery, [
@@ -204,6 +210,7 @@ exports.addDepo = async (req, res) => {
             phone_no || null,
             address || null,
             balanceAmount,
+            previousPayables,
             CB
         ]);
 
@@ -271,6 +278,7 @@ exports.updateDepo = async (req, res) => {
             phone_no,
             address,
             Balance,
+            previous_payables,
             company_id,
             CB // Modified By (user ID or username)
         } = req.body;
@@ -423,9 +431,12 @@ exports.updateDepo = async (req, res) => {
             }
         }
 
+        // Get previous_payables, default to 0 if not provided
+        const previousPayables = parseFloat(previous_payables || 0) || 0;
+
         // Step 4: Update depo table (only update balance if depo is not used in trips)
-        const updateFields = ['name = ?', 'code = ?', 'phone_no = ?', 'address = ?', 'MD = NOW()'];
-        const updateValues = [name, code || null, phone_no || null, address || null];
+        const updateFields = ['name = ?', 'code = ?', 'phone_no = ?', 'address = ?', 'previous_payables = ?', 'MD = NOW()'];
+        const updateValues = [name, code || null, phone_no || null, address || null, previousPayables];
         
         if (!isDepoUsedInTrips) {
             updateFields.push('Balance = ?');
