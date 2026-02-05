@@ -101,6 +101,7 @@ router.delete('/deleteVehicleExpenseType', vehicleExpenseTypeController.deleteVe
 // Customers
 router.get('/getCustomers', customersController.getCustomers);
 router.get('/getCustomer', customersController.getCustomer);
+router.get('/getCustomerTypes', customersController.getCustomerTypes);
 router.get('/getCustomerSales', customersController.getCustomerSales);
 router.get('/getCustomerPayments', customersController.getCustomerPayments);
 router.get('/getCustomersDueAmounts', customersController.getCustomersDueAmounts);

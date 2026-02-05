@@ -10,6 +10,8 @@ exports.getCustomers = async (req, res) => {
                 c.phone,
                 c.address,
                 c.Previous_Dues,
+                c.customer_type_id,
+                ct.type_name as customer_type_name,
                 c.active,
                 c.CD,
                 c.CB,
@@ -36,6 +38,7 @@ exports.getCustomers = async (req, res) => {
                     )
                 ) as customer_dues
             FROM customers c
+            LEFT JOIN customer_types ct ON c.customer_type_id = ct.id
             LEFT JOIN (
                 SELECT 
                     client_id,
@@ -57,7 +60,6 @@ exports.getCustomers = async (req, res) => {
             ORDER BY c.name
         `;
         const [rows] = await db.execute(query);
-        console.log(`[getCustomers] Returning ${rows.length} customers`);
         res.json(rows);
     } catch (err) {
         console.error('Error fetching customers:', err);
@@ -77,7 +79,7 @@ exports.getCustomer = async (req, res) => {
             return res.status(400).json({ message: 'Customer ID is required' });
         }
 
-        const query = 'SELECT id, name, phone, address, Previous_Dues, active, CD, CB, MD FROM customers WHERE id = ? AND active = 1';
+        const query = 'SELECT id, name, phone, address, Previous_Dues, customer_type_id, active, CD, CB, MD FROM customers WHERE id = ? AND active = 1';
         const [rows] = await db.execute(query, [id]);
         
         if (rows.length === 0) {
@@ -98,7 +100,8 @@ exports.addCustomer = async (req, res) => {
             name,
             phone,
             address,
-            Previous_Dues
+            Previous_Dues,
+            customer_type_id
         } = req.body;
 
         if (!name) {
@@ -109,10 +112,12 @@ exports.addCustomer = async (req, res) => {
         const CB = req.body.CB || 'System';
         // Get Previous_Dues, default to 0 if not provided
         const previousDues = parseFloat(Previous_Dues || 0) || 0;
+        // Get customer_type_id, can be null
+        const customerTypeId = customer_type_id ? parseInt(customer_type_id) : null;
 
         const query = `
-            INSERT INTO customers (name, phone, address, Previous_Dues, active, CB, CD, MD) 
-            VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())
+            INSERT INTO customers (name, phone, address, Previous_Dues, customer_type_id, active, CB, CD, MD) 
+            VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), NOW())
         `;
 
         const [result] = await db.execute(query, [
@@ -120,6 +125,7 @@ exports.addCustomer = async (req, res) => {
             phone || null,
             address || null,
             previousDues,
+            customerTypeId,
             CB
         ]);
 
@@ -146,6 +152,7 @@ exports.updateCustomer = async (req, res) => {
             phone,
             address,
             Previous_Dues,
+            customer_type_id,
             is_active,
             active
         } = req.body;
@@ -161,6 +168,8 @@ exports.updateCustomer = async (req, res) => {
         const activeValue = is_active !== undefined ? is_active : (active !== undefined ? active : 1);
         // Get Previous_Dues, default to 0 if not provided
         const previousDues = parseFloat(Previous_Dues || 0) || 0;
+        // Get customer_type_id, can be null
+        const customerTypeId = customer_type_id ? parseInt(customer_type_id) : null;
 
         const query = `
             UPDATE customers SET 
@@ -168,6 +177,7 @@ exports.updateCustomer = async (req, res) => {
                 phone = ?,
                 address = ?,
                 Previous_Dues = ?,
+                customer_type_id = ?,
                 active = ?,
                 MD = NOW()
             WHERE id = ?
@@ -178,6 +188,7 @@ exports.updateCustomer = async (req, res) => {
             phone || null,
             address || null,
             previousDues,
+            customerTypeId,
             activeValue ? 1 : 0,
             id
         ]);
@@ -438,6 +449,27 @@ ORDER BY due DESC, c.name ASC`;
         res.json(rows);
     } catch (err) {
         console.error('Error fetching customers due amounts:', err);
+        if (err.code === 'ER_NO_SUCH_TABLE') {
+            res.json([]);
+        } else {
+            res.status(500).json({ message: 'Server Error', error: err.message });
+        }
+    }
+};
+
+// Get all customer types
+exports.getCustomerTypes = async (req, res) => {
+    try {
+        const query = `
+            SELECT id, type_name, active 
+            FROM customer_types 
+            WHERE active = 1 
+            ORDER BY type_name
+        `;
+        const [rows] = await db.execute(query);
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching customer types:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {
             res.json([]);
         } else {
