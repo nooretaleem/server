@@ -3088,6 +3088,7 @@ exports.addSale = async (req, res) => {
             trip_id,
             trip_product_id,
             client_id,
+            customer_type_id,
             Qty,
             capacity,
             fuel,
@@ -3211,6 +3212,90 @@ exports.addSale = async (req, res) => {
              WHERE id = ? AND active = 1`,
             [newQtySold, trip_product_id]
         );
+        
+        // When customer type is Self: add fuel to fuel_tanks, create daily_tank_inventory record
+        try {
+            let isSelf = false;
+            if (customer_type_id) {
+                const [ctRows] = await connection.execute(
+                    `SELECT type_name FROM customer_types WHERE id = ? AND (active = 1 OR active IS NULL) LIMIT 1`,
+                    [customer_type_id]
+                );
+                if (ctRows.length > 0 && (ctRows[0].type_name || '').toLowerCase() === 'self') {
+                    isSelf = true;
+                }
+            }
+            if (isSelf) {
+                const pump_id = client_id;
+                console.log(`[Tank Stock] Self sale: pump_id=${pump_id}, fuel=${requestedFuel}L`);
+
+                const [tripProductRows] = await connection.execute(
+                    `SELECT product_type FROM trip_products WHERE id = ? AND active = 1`,
+                    [trip_product_id]
+                );
+                if (tripProductRows.length === 0) {
+                    console.log(`[Tank Stock] ✗ Trip product ${trip_product_id} not found`);
+                } else {
+                    const product_type = tripProductRows[0].product_type;
+                    let fuelTypeName = product_type;
+                    if (product_type === 'Mobile/Lube Oil') fuelTypeName = 'Mobile Oil';
+                    if (product_type === 'PMG') fuelTypeName = 'Petrol';
+                    if (product_type === 'HSD') fuelTypeName = 'Diesel';
+
+                    const [tankRows] = await connection.execute(
+                        `SELECT id, pump_id, fuel_type, capacity, current_level 
+                         FROM fuel_tanks 
+                         WHERE pump_id = ? AND fuel_type = ? AND (Active = 1 OR Active IS NULL)
+                         LIMIT 1`,
+                        [pump_id, fuelTypeName]
+                    );
+                    if (tankRows.length === 0) {
+                        console.log(`[Tank Stock] ✗ No fuel_tank found for pump_id=${pump_id}, fuel_type=${fuelTypeName}`);
+                    } else {
+                        const tank = tankRows[0];
+                        const tank_id = tank.id;
+                        const opening_level = parseFloat(tank.current_level || 0);
+                        const closing_level = opening_level + requestedFuel;
+                        const capacityVal = parseFloat(tank.capacity || 0);
+                        if (capacityVal > 0 && closing_level > capacityVal) {
+                            console.log(`[Tank Stock] ✗ Tank capacity exceeded: ${closing_level}L > ${capacityVal}L`);
+                        } else {
+                            await connection.execute(
+                                `UPDATE fuel_tanks SET current_level = ?, MD = NOW() WHERE id = ?`,
+                                [closing_level, tank_id]
+                            );
+                            console.log(`[Tank Stock] ✓ fuel_tanks.current_level updated: ${opening_level}L + ${requestedFuel}L = ${closing_level}L`);
+
+                            const saleDate = date || new Date().toISOString().split('T')[0];
+                            let dailyEntryId;
+                            const [dseRows] = await connection.execute(
+                                `SELECT id FROM daily_sales_entries WHERE pump_id = ? AND entry_date = ? LIMIT 1`,
+                                [pump_id, saleDate]
+                            );
+                            if (dseRows.length > 0) {
+                                dailyEntryId = dseRows[0].id;
+                            } else {
+                                const [dseIns] = await connection.execute(
+                                    `INSERT INTO daily_sales_entries (pump_id, entry_date, status, submitted_at, CB, MB, cd, md, Active)
+                                     VALUES (?, ?, 'submitted', NOW(), ?, ?, NOW(), NOW(), 1)`,
+                                    [pump_id, saleDate, CB, CB]
+                                );
+                                dailyEntryId = dseIns.insertId;
+                            }
+                            const purchase_reference = `POL-${result.insertId}`;
+                            await connection.execute(
+                                `INSERT INTO daily_tank_inventory (daily_entry_id, tank_id, opening_level, closing_level, received_quantity, sold_quantity, purchase_reference, cd, md, CB, MB, Active)
+                                 VALUES (?, ?, ?, ?, ?, 0, ?, NOW(), NOW(), ?, ?, 1)`,
+                                [dailyEntryId, tank_id, opening_level, closing_level, requestedFuel, purchase_reference, CB, CB]
+                            );
+                            console.log(`[Tank Stock] ✓ daily_tank_inventory created, purchase_reference=${purchase_reference}`);
+                        }
+                    }
+                }
+            }
+        } catch (tankStockError) {
+            console.error('[Tank Stock] ✗ ERROR:', tankStockError);
+        }
         
         // Check if trip should be closed (all payments cleared and all fuel sold)
         await checkAndCloseTrip(connection, trip_id);

@@ -61,6 +61,26 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
+// Get all active accounts (for recovery dropdown - no bankId required)
+exports.getActiveAccounts = async (req, res) => {
+    try {
+        const query = `
+            SELECT a.ID, a.BankID, a.AccountNo, a.AccountTitle, a.Balance,
+                   COALESCE(b.Name, '') as bankName
+            FROM accounts a
+            LEFT JOIN bank b ON b.ID = a.BankID AND b.active = 1
+            WHERE a.active = 1
+            ORDER BY b.Name, a.AccountTitle
+        `;
+        const [rows] = await db.execute(query);
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching active accounts:', err);
+        if (err.code === 'ER_NO_SUCH_TABLE') res.json([]);
+        else res.status(500).json({ message: 'Server Error', error: err.message });
+    }
+};
+
 // Get all accounts for a specific bank (only active ones)
 exports.getAccounts = async (req, res) => {
     try {
