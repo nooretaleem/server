@@ -3,11 +3,12 @@ const db = require('../models/db');
 // Get all meters
 exports.getMeters = async (req, res) => {
     try {
-        const stationId = req.query.station_id;
+        const stationId = req.query.customer_id;
         let query = `
             SELECT 
                 m.id,
-                m.station_id,
+                m.customer_id,
+                m.customer_id as station_id,
                 m.fuel_type_id,
                 m.meter_no,
                 m.CB,
@@ -15,21 +16,21 @@ exports.getMeters = async (req, res) => {
                 m.MB,
                 m.MD,
                 m.Active,
-                s.name as station_name,
+                c.name as station_name,
                 ft.name as fuel_type_name
             FROM meters m
-            LEFT JOIN stations s ON m.station_id = s.id
+            LEFT JOIN customers c ON m.customer_id = c.id
             LEFT JOIN fuel_types ft ON m.fuel_type_id = ft.id
             WHERE m.Active = 1
         `;
         const params = [];
         
         if (stationId) {
-            query += ' AND m.station_id = ?';
+            query += ' AND m.customer_id = ?';
             params.push(stationId);
         }
         
-        query += ' ORDER BY s.name, ft.name, m.meter_no';
+        query += ' ORDER BY c.name, ft.name, m.meter_no';
         
         const [rows] = await db.execute(query, params);
         res.json(rows);
@@ -54,7 +55,7 @@ exports.getMeter = async (req, res) => {
         const query = `
             SELECT 
                 m.id,
-                m.station_id,
+                m.customer_id,
                 m.fuel_type_id,
                 m.meter_no,
                 m.CB,
@@ -62,10 +63,10 @@ exports.getMeter = async (req, res) => {
                 m.MB,
                 m.MD,
                 m.Active,
-                s.name as station_name,
+                c.name as station_name,
                 ft.name as fuel_type_name
             FROM meters m
-            LEFT JOIN stations s ON m.station_id = s.id
+            LEFT JOIN customers c ON m.customer_id = c.id
             LEFT JOIN fuel_types ft ON m.fuel_type_id = ft.id
             WHERE m.id = ? AND m.Active = 1
         `;
@@ -85,10 +86,10 @@ exports.getMeter = async (req, res) => {
 // Add new meter
 exports.addMeter = async (req, res) => {
     try {
-        const { station_id, fuel_type_id, meter_no } = req.body;
+        const { customer_id, fuel_type_id, meter_no } = req.body;
 
-        if (!station_id) {
-            return res.status(400).json({ message: 'Station ID is required' });
+        if (!customer_id) {
+            return res.status(400).json({ message: 'Customer (station) ID is required' });
         }
         if (!fuel_type_id) {
             return res.status(400).json({ message: 'Fuel Type ID is required' });
@@ -100,9 +101,9 @@ exports.addMeter = async (req, res) => {
         // Check for duplicate meter number at the same station and fuel type
         const checkQuery = `
             SELECT id FROM meters 
-            WHERE station_id = ? AND fuel_type_id = ? AND meter_no = ? AND Active = 1
+            WHERE customer_id = ? AND fuel_type_id = ? AND meter_no = ? AND Active = 1
         `;
-        const [existing] = await db.execute(checkQuery, [station_id, fuel_type_id, meter_no]);
+        const [existing] = await db.execute(checkQuery, [customer_id, fuel_type_id, meter_no]);
         
         if (existing.length > 0) {
             return res.status(400).json({ 
@@ -113,11 +114,11 @@ exports.addMeter = async (req, res) => {
         const CB = req.body.CB || 'System';
 
         const query = `
-            INSERT INTO meters (station_id, fuel_type_id, meter_no, active, CB, CD, MD) 
+            INSERT INTO meters (customer_id, fuel_type_id, meter_no, active, CB, CD, MD) 
             VALUES (?, ?, ?, 1, ?, NOW(), NOW())
         `;
 
-        const [result] = await db.execute(query, [station_id, fuel_type_id, meter_no, CB]);
+        const [result] = await db.execute(query, [customer_id, fuel_type_id, meter_no, CB]);
 
         res.json({
             message: 'Meter added successfully',
@@ -136,13 +137,13 @@ exports.addMeter = async (req, res) => {
 // Update meter
 exports.updateMeter = async (req, res) => {
     try {
-        const { id, station_id, fuel_type_id, meter_no, Active, active } = req.body;
+        const { id, customer_id, fuel_type_id, meter_no, Active, active } = req.body;
 
         if (!id) {
             return res.status(400).json({ message: 'Meter ID is required' });
         }
-        if (!station_id) {
-            return res.status(400).json({ message: 'Station ID is required' });
+        if (!customer_id) {
+            return res.status(400).json({ message: 'Customer (station) ID is required' });
         }
         if (!fuel_type_id) {
             return res.status(400).json({ message: 'Fuel Type ID is required' });
@@ -154,9 +155,9 @@ exports.updateMeter = async (req, res) => {
         // Check for duplicate meter number (excluding current record)
         const checkQuery = `
             SELECT id FROM meters 
-            WHERE station_id = ? AND fuel_type_id = ? AND meter_no = ? AND id != ? AND Active = 1
+            WHERE customer_id = ? AND fuel_type_id = ? AND meter_no = ? AND id != ? AND Active = 1
         `;
-        const [existing] = await db.execute(checkQuery, [station_id, fuel_type_id, meter_no, id]);
+        const [existing] = await db.execute(checkQuery, [customer_id, fuel_type_id, meter_no, id]);
         
         if (existing.length > 0) {
             return res.status(400).json({ 
@@ -169,7 +170,7 @@ exports.updateMeter = async (req, res) => {
 
         const query = `
             UPDATE meters SET 
-                station_id = ?,
+                customer_id = ?,
                 fuel_type_id = ?,
                 meter_no = ?,
                 Active = ?,
@@ -179,7 +180,7 @@ exports.updateMeter = async (req, res) => {
         `;
 
         const [result] = await db.execute(query, [
-            station_id,
+            customer_id,
             fuel_type_id,
             meter_no,
             activeValue ? 1 : 0,

@@ -1,6 +1,17 @@
 const db = require('../models/db');
 
 // Get all customers
+/* --Calculate customer dues correctly:
+--Since recoveries are applied to Previous_Dues FIRST, then to POL Sale:
+--The correct formula is: Current Previous_Dues + (POL Sale Amount - Recoveries Applied to POL Sale)
+--To calculate "Recoveries Applied to POL Sale", we need to know how much went to Previous_Dues.
+                --Since we don't track original Previous_Dues, we use this logic:
+--If Current Previous_Dues >= Total Recoveries: All recoveries went to Previous_Dues, so POL Sale Dues = Sales
+--If Current Previous_Dues < Total Recoveries: (Total Recoveries - Current Previous_Dues) went to POL Sale
+--But this assumes Current Previous_Dues represents what's left after recoveries, which is correct.
+--So: Recoveries Applied to POL Sale = GREATEST(0, Total Recoveries - Current Previous_Dues)
+--POL Sale Dues = Sales - Recoveries Applied to POL Sale
+--Total Dues = Current Previous_Dues + POL Sale Dues */
 exports.getCustomers = async (req, res) => {
     try {
         const query = `
@@ -10,35 +21,25 @@ exports.getCustomers = async (req, res) => {
                 c.phone,
                 c.address,
                 c.Previous_Dues,
-                c.customer_type_id,
-                ct.type_name as customer_type_name,
                 c.active,
                 c.CD,
                 c.CB,
                 c.MD,
+                NULL as customer_type_id,
+                'External' as customer_type_name,
                 COALESCE(sales.total_purchased_fuel_ltrs, 0) as total_purchased_fuel_ltrs,
                 COALESCE(sales.total_amount, 0) as total_sales,
                 COALESCE(recoveries.total_paid, 0) as total_paid,
-                -- Calculate customer dues correctly:
-                -- Since recoveries are applied to Previous_Dues FIRST, then to POL Sale:
-                -- The correct formula is: Current Previous_Dues + (POL Sale Amount - Recoveries Applied to POL Sale)
-                -- To calculate "Recoveries Applied to POL Sale", we need to know how much went to Previous_Dues.
-                -- Since we don't track original Previous_Dues, we use this logic:
-                -- If Current Previous_Dues >= Total Recoveries: All recoveries went to Previous_Dues, so POL Sale Dues = Sales
-                -- If Current Previous_Dues < Total Recoveries: (Total Recoveries - Current Previous_Dues) went to POL Sale
-                -- But this assumes Current Previous_Dues represents what's left after recoveries, which is correct.
-                -- So: Recoveries Applied to POL Sale = GREATEST(0, Total Recoveries - Current Previous_Dues)
-                -- POL Sale Dues = Sales - Recoveries Applied to POL Sale
-                -- Total Dues = Current Previous_Dues + POL Sale Dues
+               
                 (
                     COALESCE(c.Previous_Dues, 0) + 
                     GREATEST(0, 
                         COALESCE(sales.total_amount, 0) - 
                         GREATEST(0, COALESCE(recoveries.total_paid, 0) - COALESCE(c.Previous_Dues, 0))
                     )
-                ) as customer_dues
+                ) as customer_dues,
+                'customer' as source_type
             FROM customers c
-            LEFT JOIN customer_types ct ON c.customer_type_id = ct.id
             LEFT JOIN (
                 SELECT 
                     client_id,
@@ -57,7 +58,55 @@ exports.getCustomers = async (req, res) => {
                 GROUP BY ClientID
             ) recoveries ON c.id = recoveries.ClientID
             WHERE c.active = 1
-            ORDER BY c.name
+            
+            UNION ALL
+            
+            SELECT 
+                pp.id,
+                pp.name,
+                NULL as phone,
+                pp.location as address,
+                COALESCE(pp.Previous_Dues, 0) as Previous_Dues,
+                pp.Active as active,
+                pp.CD,
+                pp.CB,
+                pp.MD,
+                NULL as customer_type_id,
+                'Self' as customer_type_name,
+                COALESCE(sales.total_purchased_fuel_ltrs, 0) as total_purchased_fuel_ltrs,
+                COALESCE(sales.total_amount, 0) as total_sales,
+                COALESCE(recoveries.total_paid, 0) as total_paid,
+                -- Calculate customer dues correctly for petrol pumps:
+                -- Same formula as customers: Current Previous_Dues + (POL Sale Amount - Recoveries Applied to POL Sale)
+                (
+                    COALESCE(pp.Previous_Dues, 0) + 
+                    GREATEST(0, 
+                        COALESCE(sales.total_amount, 0) - 
+                        GREATEST(0, COALESCE(recoveries.total_paid, 0) - COALESCE(pp.Previous_Dues, 0))
+                    )
+                ) as customer_dues,
+                'petrol_pump' as source_type
+            FROM petrol_pumps pp
+            LEFT JOIN (
+                SELECT 
+                    client_id,
+                    SUM(fuel) AS total_purchased_fuel_ltrs,
+                    SUM(total_amount) AS total_amount
+                FROM pol_sale
+                WHERE Active = 1
+                GROUP BY client_id
+            ) sales ON pp.id = sales.client_id
+            LEFT JOIN (
+                SELECT 
+                    ClientID,
+                    SUM(Amount) AS total_paid
+                FROM recoveries
+                WHERE Active = 1
+                GROUP BY ClientID
+            ) recoveries ON pp.id = recoveries.ClientID
+            WHERE pp.Active = 1
+            
+            ORDER BY name
         `;
         const [rows] = await db.execute(query);
         res.json(rows);
@@ -79,13 +128,13 @@ exports.getCustomer = async (req, res) => {
             return res.status(400).json({ message: 'Customer ID is required' });
         }
 
-        const query = 'SELECT id, name, phone, address, Previous_Dues, customer_type_id, active, CD, CB, MD FROM customers WHERE id = ? AND active = 1';
+        const query = 'SELECT id, name, phone, address, Previous_Dues, active, CD, CB, MD FROM customers WHERE id = ? AND active = 1';
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Customer not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching customer:', err);
@@ -100,8 +149,7 @@ exports.addCustomer = async (req, res) => {
             name,
             phone,
             address,
-            Previous_Dues,
-            customer_type_id
+            Previous_Dues
         } = req.body;
 
         if (!name) {
@@ -112,12 +160,10 @@ exports.addCustomer = async (req, res) => {
         const CB = req.body.CB || 'System';
         // Get Previous_Dues, default to 0 if not provided
         const previousDues = parseFloat(Previous_Dues || 0) || 0;
-        // Get customer_type_id, can be null
-        const customerTypeId = customer_type_id ? parseInt(customer_type_id) : null;
 
         const query = `
-            INSERT INTO customers (name, phone, address, Previous_Dues, customer_type_id, active, CB, CD, MD) 
-            VALUES (?, ?, ?, ?, ?, 1, ?, NOW(), NOW())
+            INSERT INTO customers (name, phone, address, Previous_Dues, active, CB, CD, MD) 
+            VALUES (?, ?, ?, ?, 1, ?, NOW(), NOW())
         `;
 
         const [result] = await db.execute(query, [
@@ -125,7 +171,6 @@ exports.addCustomer = async (req, res) => {
             phone || null,
             address || null,
             previousDues,
-            customerTypeId,
             CB
         ]);
 
@@ -152,7 +197,6 @@ exports.updateCustomer = async (req, res) => {
             phone,
             address,
             Previous_Dues,
-            customer_type_id,
             is_active,
             active
         } = req.body;
@@ -168,8 +212,6 @@ exports.updateCustomer = async (req, res) => {
         const activeValue = is_active !== undefined ? is_active : (active !== undefined ? active : 1);
         // Get Previous_Dues, default to 0 if not provided
         const previousDues = parseFloat(Previous_Dues || 0) || 0;
-        // Get customer_type_id, can be null
-        const customerTypeId = customer_type_id ? parseInt(customer_type_id) : null;
 
         const query = `
             UPDATE customers SET 
@@ -177,7 +219,6 @@ exports.updateCustomer = async (req, res) => {
                 phone = ?,
                 address = ?,
                 Previous_Dues = ?,
-                customer_type_id = ?,
                 active = ?,
                 MD = NOW()
             WHERE id = ?
@@ -188,7 +229,6 @@ exports.updateCustomer = async (req, res) => {
             phone || null,
             address || null,
             previousDues,
-            customerTypeId,
             activeValue ? 1 : 0,
             id
         ]);
@@ -244,7 +284,7 @@ exports.deleteCustomer = async (req, res) => {
 exports.getCustomerSales = async (req, res) => {
     try {
         const client_id = req.query.client_id;
-        
+
         if (!client_id) {
             return res.status(400).json({ message: 'Client ID is required' });
         }
@@ -285,9 +325,9 @@ exports.getCustomerSales = async (req, res) => {
             WHERE ps.client_id = ? AND ps.Active = 1
             ORDER BY ps.date ASC, ps.id ASC
         `;
-        
+
         const [salesRows] = await db.execute(salesQuery, [client_id]);
-        
+
         // Process sales rows - depo_id is already correctly matched
         const processedSales = salesRows.map(sale => {
             return {
@@ -296,17 +336,17 @@ exports.getCustomerSales = async (req, res) => {
                 depo_name: sale.depo_name || null
             };
         });
-        
+
         // Calculate total sales amount (using unique pol_sale records)
         const totalSales = processedSales.reduce((sum, sale) => sum + parseFloat(sale.total_amount || 0), 0);
-        
+
         // Calculate paid amount per sale proportionally
         // Using FIFO approach: distribute payments to oldest sales first
         let remainingPaid = totalPaid;
         const salesWithPaid = processedSales.map((sale) => {
             const saleAmount = parseFloat(sale.total_amount || 0);
             let paidAmount = 0;
-            
+
             if (remainingPaid > 0 && saleAmount > 0) {
                 if (remainingPaid >= saleAmount) {
                     // Full payment for this sale
@@ -318,13 +358,13 @@ exports.getCustomerSales = async (req, res) => {
                     remainingPaid = 0;
                 }
             }
-            
+
             return {
                 ...sale,
                 paid: paidAmount
             };
         });
-        
+
         // Sort back to DESC order for display
         salesWithPaid.sort((a, b) => {
             const dateA = new Date(a.date);
@@ -334,7 +374,7 @@ exports.getCustomerSales = async (req, res) => {
             }
             return (b.id || 0) - (a.id || 0);
         });
-        
+
         res.json(salesWithPaid);
     } catch (err) {
         console.error('Error fetching customer sales:', err);
@@ -350,7 +390,7 @@ exports.getCustomerSales = async (req, res) => {
 exports.getCustomerPayments = async (req, res) => {
     try {
         const ClientID = req.query.ClientID;
-        
+
         if (!ClientID) {
             return res.status(400).json({ message: 'Client ID is required' });
         }
@@ -377,7 +417,7 @@ exports.getCustomerPayments = async (req, res) => {
             WHERE r.ClientID = ? AND r.Active = 1
             ORDER BY r.Date DESC, r.ID DESC
         `;
-        
+
         const [rows] = await db.execute(query, [ClientID]);
         res.json(rows);
     } catch (err) {
@@ -444,7 +484,7 @@ WHERE c.Active = 1
   )
 
 ORDER BY due DESC, c.name ASC`;
-        
+
         const [rows] = await db.execute(query);
         res.json(rows);
     } catch (err) {
@@ -470,6 +510,36 @@ exports.getCustomerTypes = async (req, res) => {
         res.json(rows);
     } catch (err) {
         console.error('Error fetching customer types:', err);
+        if (err.code === 'ER_NO_SUCH_TABLE') {
+            res.json([]);
+        } else {
+            res.status(500).json({ message: 'Server Error', error: err.message });
+        }
+    }
+};
+
+// Get customer fuel quantities by type (for stations)
+exports.getCustomerFuelByType = async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                c.id,
+                c.name,
+                c.address,
+                COALESCE(SUM(CASE WHEN tp.product_type = 'PMG' THEN ps.fuel ELSE 0 END), 0) as pmg_quantity,
+                COALESCE(SUM(CASE WHEN tp.product_type = 'HSD' THEN ps.fuel ELSE 0 END), 0) as hsd_quantity,
+                COALESCE(SUM(CASE WHEN tp.product_type = 'Mobile/Lube Oil' THEN ps.fuel ELSE 0 END), 0) as mobile_oil_quantity
+            FROM customers c
+            LEFT JOIN pol_sale ps ON c.id = ps.client_id AND ps.Active = 1
+            LEFT JOIN trip_products tp ON ps.trip_product_id = tp.id AND tp.Active = 1
+            WHERE c.active = 1
+            GROUP BY c.id, c.name, c.address
+            ORDER BY c.name
+        `;
+        const [rows] = await db.execute(query);
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching customer fuel by type:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {
             res.json([]);
         } else {

@@ -5,12 +5,12 @@ exports.getFuelRates = async (req, res) => {
     try {
         const fuelTypeId = req.query.fuel_type_id;
         const effectiveDate = req.query.effective_date;
-        
+
         let query = `
             SELECT 
                 fr.id,
                 fr.fuel_type_id,
-                fr.rate,
+                fr.rate_per_liter,
                 fr.effective_date,
                 fr.CB,
                 fr.CD,
@@ -23,7 +23,7 @@ exports.getFuelRates = async (req, res) => {
             WHERE fr.Active = 1
         `;
         const params = [];
-        
+
         if (fuelTypeId) {
             query += ' AND fr.fuel_type_id = ?';
             params.push(fuelTypeId);
@@ -32,9 +32,9 @@ exports.getFuelRates = async (req, res) => {
             query += ' AND fr.effective_date = ?';
             params.push(effectiveDate);
         }
-        
+
         query += ' ORDER BY fr.effective_date DESC, ft.name';
-        
+
         const [rows] = await db.execute(query, params);
         res.json(rows);
     } catch (err) {
@@ -52,7 +52,7 @@ exports.getCurrentFuelRate = async (req, res) => {
     try {
         const fuelTypeId = req.query.fuel_type_id;
         const date = req.query.date || new Date().toISOString().split('T')[0];
-        
+
         if (!fuelTypeId) {
             return res.status(400).json({ message: 'Fuel Type ID is required' });
         }
@@ -61,23 +61,22 @@ exports.getCurrentFuelRate = async (req, res) => {
             SELECT 
                 fr.id,
                 fr.fuel_type_id,
-                fr.rate,
+                fr.rate_per_liter,
                 fr.effective_date,
                 ft.name as fuel_type_name
             FROM fuel_rates fr
             LEFT JOIN fuel_types ft ON fr.fuel_type_id = ft.id
             WHERE fr.fuel_type_id = ? 
             AND fr.effective_date <= ?
-            AND fr.Active = 1
             ORDER BY fr.effective_date DESC
             LIMIT 1
         `;
         const [rows] = await db.execute(query, [fuelTypeId, date]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'No fuel rate found for this fuel type' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching current fuel rate:', err);
@@ -110,11 +109,11 @@ exports.getFuelRate = async (req, res) => {
             WHERE fr.id = ? AND fr.Active = 1
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Fuel Rate not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching fuel rate:', err);
@@ -216,7 +215,7 @@ exports.updateFuelRate = async (req, res) => {
 exports.deleteFuelRate = async (req, res) => {
     try {
         const id = req.body.id || req.params.id;
-        
+
         if (!id) {
             return res.status(400).json({ message: 'Fuel Rate ID is required' });
         }

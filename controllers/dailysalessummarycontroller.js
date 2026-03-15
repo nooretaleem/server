@@ -23,10 +23,10 @@ exports.getDailySalesSummaries = async (req, res) => {
                 dss.MB,
                 dss.MD,
                 dss.Active,
-                s.name as station_name,
+                c.name as station_name,
                 ft.name as fuel_type_name
             FROM daily_sales_summary dss
-            LEFT JOIN stations s ON dss.station_id = s.id
+            LEFT JOIN customers c ON dss.station_id = c.id
             LEFT JOIN fuel_types ft ON dss.fuel_type_id = ft.id
             WHERE dss.Active = 1
         `;
@@ -49,7 +49,7 @@ exports.getDailySalesSummaries = async (req, res) => {
             params.push(startDate, endDate);
         }
         
-        query += ' ORDER BY dss.sale_date DESC, s.name, ft.name';
+        query += ' ORDER BY dss.sale_date DESC, c.name, ft.name';
         
         const [rows] = await db.execute(query, params);
         res.json(rows);
@@ -85,10 +85,10 @@ exports.getDailySalesSummary = async (req, res) => {
                 dss.MB,
                 dss.MD,
                 dss.Active,
-                s.name as station_name,
+                c.name as station_name,
                 ft.name as fuel_type_name
             FROM daily_sales_summary dss
-            LEFT JOIN stations s ON dss.station_id = s.id
+            LEFT JOIN customers c ON dss.station_id = c.id
             LEFT JOIN fuel_types ft ON dss.fuel_type_id = ft.id
             WHERE dss.id = ? AND dss.Active = 1
         `;
@@ -135,8 +135,44 @@ exports.addDailySalesSummary = async (req, res) => {
         const [existing] = await db.execute(checkQuery, [station_id, fuel_type_id, sale_date]);
         
         if (existing.length > 0) {
-            return res.status(400).json({ 
-                message: 'Daily sales summary already exists for this station, fuel type, and date' 
+            // Get existing credit_sale so cash_sale = total_amount - credit_sale (all sales into cash, minus what's already credit)
+            const [existingRow] = await db.execute(
+                'SELECT credit_sale FROM daily_sales_summary WHERE id = ?',
+                [existing[0].id]
+            );
+            const existingCredit = existingRow.length > 0 ? (parseFloat(existingRow[0].credit_sale) || 0) : 0;
+            const calculatedAmount = total_amount || (total_liters && rate ? parseFloat(total_liters) * parseFloat(rate) : 0);
+            const newCashSale = Math.max(0, calculatedAmount - existingCredit);
+
+            const updateQuery = `
+                UPDATE daily_sales_summary SET
+                    total_liters = ?,
+                    rate = ?,
+                    total_amount = ?,
+                    cash_sale = ?,
+                    MB = ?,
+                    MD = NOW()
+                WHERE id = ?
+            `;
+            // Get CB (Created By) from request body - required, no default to 'System'
+            const CB = req.body.CB;
+            if (!CB) {
+                return res.status(400).json({ message: 'CB (Created By - username) is required' });
+            }
+
+            const [updateResult] = await db.execute(updateQuery, [
+                total_liters || null,
+                rate || null,
+                calculatedAmount,
+                newCashSale,
+                CB,
+                existing[0].id
+            ]);
+            
+            return res.json({
+                message: 'Daily sales summary updated successfully',
+                id: existing[0].id,
+                updated: true
             });
         }
 
@@ -152,13 +188,15 @@ exports.addDailySalesSummary = async (req, res) => {
 
         const CB = req.body.CB || 'System';
 
+        // When creating from meter readings: all sales amount goes into cash_sale; credit_sale = 0
         const query = `
             INSERT INTO daily_sales_summary (
                 station_id, fuel_type_id, sale_date,
                 total_liters, rate, total_amount,
+                credit_sale, cash_sale,
                 active, CB, CD, MD
             ) 
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, NOW(), NOW())
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?, NOW(), NOW())
         `;
 
         const [result] = await db.execute(query, [
@@ -167,6 +205,7 @@ exports.addDailySalesSummary = async (req, res) => {
             sale_date,
             total_liters || null,
             rate || null,
+            calculatedAmount,
             calculatedAmount,
             CB
         ]);
@@ -240,7 +279,19 @@ exports.updateDailySalesSummary = async (req, res) => {
         }
 
         const activeValue = Active !== undefined ? Active : (active !== undefined ? active : 1);
-        const MB = req.body.MB || 'System';
+        // Get MB (Modified By) from request body - required, no default to 'System'
+        const MB = req.body.MB;
+        if (!MB) {
+            return res.status(400).json({ message: 'MB (Modified By - username) is required' });
+        }
+
+        // cash_sale = total_amount - credit_sale so cash + credit = total
+        const [existingRow] = await db.execute(
+            'SELECT credit_sale FROM daily_sales_summary WHERE id = ?',
+            [id]
+        );
+        const existingCredit = existingRow.length > 0 ? (parseFloat(existingRow[0].credit_sale) || 0) : 0;
+        const newCashSale = Math.max(0, calculatedAmount - existingCredit);
 
         const query = `
             UPDATE daily_sales_summary SET 
@@ -250,6 +301,7 @@ exports.updateDailySalesSummary = async (req, res) => {
                 total_liters = ?,
                 rate = ?,
                 total_amount = ?,
+                cash_sale = ?,
                 Active = ?,
                 MB = ?,
                 MD = NOW()
@@ -263,6 +315,7 @@ exports.updateDailySalesSummary = async (req, res) => {
             total_liters || null,
             rate || null,
             calculatedAmount,
+            newCashSale,
             activeValue ? 1 : 0,
             MB,
             id

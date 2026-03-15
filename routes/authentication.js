@@ -25,6 +25,17 @@ const metersController = require('../controllers/meterscontroller');
 const meterReadingsController = require('../controllers/meterreadingscontroller');
 const fuelRatesController = require('../controllers/fuelratescontroller');
 const dailySalesSummaryController = require('../controllers/dailysalessummarycontroller');
+const stationTanksController = require('../controllers/stationtankscontroller');
+const stationTankStockController = require('../controllers/stationtankstockcontroller');
+const stationFuelSalesController = require('../controllers/stationfuelsalescontroller');
+const fuelStationCustomersController = require('../controllers/fuelstationcustomerscontroller');
+const fuelStationCustomerVehiclesController = require('../controllers/fuelstationcustomervehiclescontroller');
+const customerCreditSalesController = require('../controllers/customercreditsalescontroller');
+const petrolPumpDashboardController = require('../controllers/petrolpumpdashboardcontroller');
+const pumpsController = require('../controllers/pumpscontroller');
+const dailySalesEntryController = require('../controllers/dailysalesentrycontroller');
+const userController = require('../controllers/usercontroller');
+const staffController = require('../controllers/staffcontroller');
 
 // Authentication
 router.post('/login', dataController.login);
@@ -32,8 +43,34 @@ router.post('/signup', dataController.signup);
 router.get('/getAlowedModules', dataController.getAlowedModules);
 router.get('/getCurrentUser', dataController.getCurrentUser);
 
+// Staff
+router.get('/getStaff', staffController.getStaff);
+router.get('/getStaffById', staffController.getStaffById);
+router.get('/getStaffAdvanceBalance', staffController.getStaffAdvanceBalance);
+router.get('/getStaffAdvanceHistory', staffController.getStaffAdvanceHistory);
+router.post('/addStaff', staffController.addStaff);
+router.post('/updateStaff', staffController.updateStaff);
+router.post('/addStaffAdvanceRecord', staffController.addStaffAdvanceRecord);
+router.delete('/deleteStaffAdvanceRecord', staffController.deleteStaffAdvanceRecord);
+router.delete('/deleteStaff', staffController.deleteStaff);
+
+// Users
+router.get('/getUsers', userController.getUsers);
+router.get('/getRoles', userController.getRoles);
+router.get('/getModules', userController.getModules);
+router.get('/getModulesforRole', userController.getModulesforRole);
+router.post('/addUser', userController.addUser);
+router.post('/updateUser', userController.updateUser);
+router.delete('/deleteUser', userController.deleteUser);
+router.post('/addRole', userController.addRole);
+router.post('/updateRole', userController.updateRole);
+router.delete('/deleteRole', userController.deleteRole);
+router.post('/addRoleModules', userController.addRoleModules);
+
 // Dashboard
 router.get('/getDashboardData', projectController.getDashboardData);
+router.get('/getPetrolPumpDashboard', petrolPumpDashboardController.getPetrolPumpDashboard);
+router.get('/getPumpDashboardData', petrolPumpDashboardController.getPumpDashboardData);
 router.get('/getPendingTrips', projectController.getPendingTrips);
 router.get('/getCreditTrips', projectController.getCreditTrips);
 router.get('/getDealerPayables', projectController.getDealerPayables);
@@ -52,6 +89,30 @@ router.get('/getTodayRentPayments', projectController.getTodayRentPayments);
 router.get('/getTodayDealerPayments', projectController.getTodayDealerPayments);
 router.get('/getTodayRecoveries', projectController.getTodayRecoveries);
 
+// Petrol Pumps
+router.get('/getPumps', pumpsController.getPumps);
+router.get('/getPumpDetails', pumpsController.getPumpDetails);
+router.get('/getTankInventory', pumpsController.getTankInventory);
+router.get('/getDipVolumeByType', pumpsController.getDipVolumeByType);
+router.get('/checkTodayDipReadings', pumpsController.checkTodayDipReadings);
+router.post('/saveDipReadings', pumpsController.saveDipReadings);
+router.post('/createPump', pumpsController.createPump);
+router.post('/updatePump', pumpsController.updatePump);
+
+// Daily Sales Entry (submit full daily entry)
+router.get('/getPreviousDayCash', dailySalesEntryController.getPreviousDayCash);
+router.get('/getLatestNozzleReadings', dailySalesEntryController.getLatestNozzleReadings);
+router.get('/checkTodayNozzleReadings', dailySalesEntryController.checkTodayNozzleReadings);
+router.get('/getNozzleReadingsByDate', dailySalesEntryController.getNozzleReadingsByDate);
+router.post('/submitDailyEntry', dailySalesEntryController.submitDailyEntry);
+router.post('/updateNozzleReadings', dailySalesEntryController.updateNozzleReadings);
+router.post('/getExpensesByDate', dailySalesEntryController.getExpensesByDate);
+router.post('/updateExpenses', dailySalesEntryController.updateExpenses);
+router.get('/getExpenseCategories', dailySalesEntryController.getExpenseCategories);
+router.post('/saveExpenses', dailySalesEntryController.saveExpenses);
+router.post('/getCreditSalesByDate', dailySalesEntryController.getCreditSalesByDate);
+router.post('/saveCreditSales', dailySalesEntryController.saveCreditSales);
+
 // Trips
 router.get('/getTrips', tripsController.getTrips);
 router.get('/getTrip', tripsController.getTrip);
@@ -61,7 +122,8 @@ router.delete('/deleteTrip', tripsController.deleteTrip);
 router.get('/getClients', tripsController.getClients);
 router.get('/getLicenseHolders', tripsController.getLicenseHolders);
 router.get('/getVehicles', tripsController.getVehicles);
-router.get('/getPetrolPumps', tripsController.getPetrolPumps);
+// OLD getPetrolPumps route commented out - now using fuelStationCustomersController.getPetrolPumps (line 343) which queries petrol_pumps table
+// router.get('/getPetrolPumps', tripsController.getPetrolPumps); // This was querying depo table
 router.post('/addVehicle', tripsController.addVehicle);
 router.post('/updateVehicle', tripsController.updateVehicle);
 router.delete('/deleteVehicle', tripsController.deleteVehicle);
@@ -102,6 +164,9 @@ router.delete('/deleteVehicleExpenseType', vehicleExpenseTypeController.deleteVe
 router.get('/getCustomers', customersController.getCustomers);
 router.get('/getCustomer', customersController.getCustomer);
 router.get('/getCustomerTypes', customersController.getCustomerTypes);
+router.get('/getCustomerFuelByType', customersController.getCustomerFuelByType);
+router.post('/assignMeter', metersController.updateMeter);
+router.get('/getCustomerFuelByType', customersController.getCustomerFuelByType);
 router.get('/getCustomerSales', customersController.getCustomerSales);
 router.get('/getCustomerPayments', customersController.getCustomerPayments);
 router.get('/getCustomersDueAmounts', customersController.getCustomersDueAmounts);
@@ -140,6 +205,7 @@ router.post('/updateBank', bankMgmtController.updateBank);
 router.delete('/deleteBank', bankMgmtController.deleteBank);
 
 // Account Management
+router.get('/getActiveAccounts', accountController.getActiveAccounts);
 router.get('/getAccounts', accountController.getAccounts);
 router.get('/getAccount', accountController.getAccount);
 router.post('/addAccount', accountController.addAccount);
@@ -176,7 +242,6 @@ router.post('/addRecovery', recoveriesController.addRecovery);
 router.delete('/deleteRecovery', recoveriesController.deleteRecovery);
 
 // Expense Categories Management
-router.get('/getExpenseCategories', expenseCategoriesController.getExpenseCategories);
 router.get('/getExpenseCategory', expenseCategoriesController.getExpenseCategory);
 router.post('/addExpenseCategory', expenseCategoriesController.addExpenseCategory);
 router.post('/updateExpenseCategory', expenseCategoriesController.updateExpenseCategory);
@@ -227,9 +292,12 @@ router.delete('/deleteMeter', metersController.deleteMeter);
 
 // Meter Readings
 router.get('/getMeterReadings', meterReadingsController.getMeterReadings);
+router.get('/getLatestMeterReadings', meterReadingsController.getLatestMeterReadings);
 router.get('/getMeterReading', meterReadingsController.getMeterReading);
+router.get('/canEditMeterReading', meterReadingsController.canEditMeterReading);
 router.post('/addMeterReading', meterReadingsController.addMeterReading);
 router.post('/updateMeterReading', meterReadingsController.updateMeterReading);
+router.post('/updateTankStockFromReadings', meterReadingsController.updateTankStockFromReadings);
 router.delete('/deleteMeterReading', meterReadingsController.deleteMeterReading);
 
 // Fuel Rates
@@ -246,6 +314,51 @@ router.get('/getDailySalesSummary', dailySalesSummaryController.getDailySalesSum
 router.post('/addDailySalesSummary', dailySalesSummaryController.addDailySalesSummary);
 router.post('/updateDailySalesSummary', dailySalesSummaryController.updateDailySalesSummary);
 router.delete('/deleteDailySalesSummary', dailySalesSummaryController.deleteDailySalesSummary);
+
+// Station Tanks (UST)
+router.get('/getStationTanks', stationTanksController.getStationTanks);
+router.get('/getStationTank', stationTanksController.getStationTank);
+router.post('/addStationTank', stationTanksController.addStationTank);
+router.post('/updateStationTank', stationTanksController.updateStationTank);
+router.delete('/deleteStationTank', stationTanksController.deleteStationTank);
+
+// Station Tank Stock
+router.get('/getStationTankStock', stationTankStockController.getStationTankStock);
+router.get('/getStationTankStockById', stationTankStockController.getStationTankStockById);
+router.get('/getLatestTankStock', stationTankStockController.getLatestTankStock);
+router.post('/addStationTankStock', stationTankStockController.addStationTankStock);
+router.post('/updateStationTankStock', stationTankStockController.updateStationTankStock);
+router.post('/addReceivedQty', stationTankStockController.addReceivedQty);
+router.delete('/deleteStationTankStock', stationTankStockController.deleteStationTankStock);
+
+// Station Fuel Sales
+router.get('/getStationFuelSales', stationFuelSalesController.getStationFuelSales);
+router.get('/getStationFuelSale', stationFuelSalesController.getStationFuelSale);
+router.post('/addStationFuelSale', stationFuelSalesController.addStationFuelSale);
+router.post('/updateStationFuelSale', stationFuelSalesController.updateStationFuelSale);
+router.delete('/deleteStationFuelSale', stationFuelSalesController.deleteStationFuelSale);
+
+// Fuel Station Customers
+router.get('/getFuelStationCustomers', fuelStationCustomersController.getFuelStationCustomers);
+router.get('/getFuelStationCustomer', fuelStationCustomersController.getFuelStationCustomer);
+router.post('/addFuelStationCustomer', fuelStationCustomersController.addFuelStationCustomer);
+router.post('/updateFuelStationCustomer', fuelStationCustomersController.updateFuelStationCustomer);
+router.delete('/deleteFuelStationCustomer', fuelStationCustomersController.deleteFuelStationCustomer);
+router.get('/getPetrolPumps', fuelStationCustomersController.getPetrolPumps);
+
+// Fuel Station Customer Vehicles
+router.get('/getFuelStationCustomerVehicles', fuelStationCustomerVehiclesController.getFuelStationCustomerVehicles);
+router.post('/addFuelStationCustomerVehicle', fuelStationCustomerVehiclesController.addFuelStationCustomerVehicle);
+router.post('/updateFuelStationCustomerVehicle', fuelStationCustomerVehiclesController.updateFuelStationCustomerVehicle);
+router.delete('/deleteFuelStationCustomerVehicle', fuelStationCustomerVehiclesController.deleteFuelStationCustomerVehicle);
+
+// Customer Credit Sales & Ledger
+router.get('/getCreditSaleLimit', customerCreditSalesController.getCreditSaleLimit);
+router.get('/getCustomerCreditSales', customerCreditSalesController.getCustomerCreditSales);
+router.get('/getCustomerRecoveryTotal', customerCreditSalesController.getCustomerRecoveryTotal);
+router.post('/addCustomerCreditSale', customerCreditSalesController.addCustomerCreditSale);
+router.get('/getCustomerLedger', customerCreditSalesController.getCustomerLedger);
+router.post('/addCustomerRecovery', customerCreditSalesController.addCustomerRecovery);
 
 // Reports
 router.get('/getPurchaseReport', projectController.getPurchaseReport);
