@@ -2,7 +2,7 @@
   "host": "pol-service-nooretaleemacademy-08de.c.aivencloud.com",
   "user": "avnadmin",
   "password": "AVNS_UESNDgaI3P8KYsH0Qj3",
-  "database": "polbkup",
+  "database": "pol",
   "port": 15072,
   "ssl": true,
   "sslCa": "certs/ca.pem",
