@@ -1,5 +1,19 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return (
+        b.MB ||
+        b.CB ||
+        b.userName ||
+        b.username ||
+        b.UserName ||
+        b.createdBy ||
+        b.modifiedBy ||
+        'System'
+    ).toString().trim() || 'System';
+}
+
 // Get all pools with depo names (showing only current/latest depo limit per depo)
 exports.getPools = async (req, res) => {
     try {
@@ -31,22 +45,22 @@ exports.getPools = async (req, res) => {
         console.error('Error SQL state:', err.sqlState);
         console.error('Error message:', err.message);
         console.error('Full error:', JSON.stringify(err, null, 2));
-        
+
         if (err.code === 'ER_NO_SUCH_TABLE') {
             // Table doesn't exist - return empty array
             console.log('Pool table does not exist, returning empty array');
             res.json([]);
         } else if (err.code === 'ER_BAD_FIELD_ERROR') {
             // Column doesn't exist - might be case sensitivity or wrong column name
-            res.status(500).json({ 
-                message: 'Database schema error', 
+            res.status(500).json({
+                message: 'Database schema error',
                 error: 'One or more columns do not exist. Please run the create_pool_table.sql script to create the table.',
                 details: err.message,
                 hint: 'Check if the pool table exists and has the correct column names (ID, DepoID, Debit, Credit, DepoLimit, active)'
             });
         } else {
-            res.status(500).json({ 
-                message: 'Server Error', 
+            res.status(500).json({
+                message: 'Server Error',
                 error: err.message,
                 code: err.code,
                 sqlState: err.sqlState,
@@ -95,11 +109,11 @@ exports.getPoolHistory = async (req, res) => {
             WHERE p.DepoID = ? AND p.active = 1
         `;
         const [poolRows] = await db.execute(poolQuery, [depoId]);
-        
+
         // Get depo name first
         const [depoNameRows] = await db.execute('SELECT name FROM depo WHERE id = ? AND active = 1', [depoId]);
         const depoName = depoNameRows.length > 0 ? depoNameRows[0].name : null;
-        
+
         // Get advance payment transactions from advance_balance table
         let advanceRows = [];
         if (depoName) {
@@ -138,7 +152,7 @@ exports.getPoolHistory = async (req, res) => {
                   AND ab.Credit > 0
             `;
             const [advanceAddedRows] = await db.execute(advanceAddedQuery, [depoName, depoId]);
-            
+
             // Get advance payments consumed from trip transactions
             // Read from advance_balance table Debit entries with TripID
             const advanceConsumedQuery = `
@@ -157,7 +171,7 @@ exports.getPoolHistory = async (req, res) => {
                 ORDER BY ab.Date ASC, ab.ID ASC
             `;
             const [advanceConsumedRows] = await db.execute(advanceConsumedQuery, [depoId]);
-            
+
             // Calculate consumed amounts for each advance payment transaction using FIFO
             // Sort advance payments by date (oldest first) and consumed transactions by date (oldest first)
             const sortedAdvancePayments = [...advanceAddedRows].sort((a, b) => {
@@ -165,38 +179,38 @@ exports.getPoolHistory = async (req, res) => {
                 const dateB = new Date(b.transaction_date || 0);
                 return dateA - dateB;
             });
-            
+
             const sortedConsumedTransactions = [...advanceConsumedRows].sort((a, b) => {
                 const dateA = new Date(a.transaction_date || 0);
                 const dateB = new Date(b.transaction_date || 0);
                 return dateA - dateB;
             });
-            
+
             // Track remaining amounts for each advance payment and consumed transaction
             const advancePaymentRemaining = sortedAdvancePayments.map(ap => ({
                 ...ap,
                 remaining: parseFloat(ap.AdvancePayment || 0),
                 consumed: 0
             }));
-            
+
             const consumedTransactionRemaining = sortedConsumedTransactions.map(ct => ({
                 ...ct,
                 remaining: parseFloat(ct.consumed_amount || 0)
             }));
-            
+
             // Allocate consumed transactions to advance payments using FIFO
             for (const consumed of consumedTransactionRemaining) {
                 let remainingToAllocate = consumed.remaining;
-                
+
                 for (const advancePayment of advancePaymentRemaining) {
                     if (remainingToAllocate <= 0) break;
                     if (advancePayment.remaining <= 0) continue;
-                    
+
                     // Check if consumed transaction date is after or equal to advance payment date
                     const advanceDate = new Date(advancePayment.transaction_date || 0);
                     const consumedDate = new Date(consumed.transaction_date || 0);
                     if (consumedDate < advanceDate) continue;
-                    
+
                     // Allocate as much as possible
                     const allocation = Math.min(remainingToAllocate, advancePayment.remaining);
                     advancePayment.consumed += allocation;
@@ -204,7 +218,7 @@ exports.getPoolHistory = async (req, res) => {
                     remainingToAllocate -= allocation;
                 }
             }
-            
+
             // Update advanceAddedRows with consumed amounts from FIFO allocation
             console.log('FIFO Allocation Results:');
             console.log('Payment rows:', advancePaymentRemaining.map(ap => ({
@@ -214,12 +228,12 @@ exports.getPoolHistory = async (req, res) => {
                 consumed: ap.consumed,
                 remaining: ap.remaining
             })));
-            
+
             advanceAddedRows.forEach((row, index) => {
                 // Find the matching payment in the FIFO allocation results
                 // Match by index since both arrays are sorted by date
                 const matchingPayment = advancePaymentRemaining[index];
-                
+
                 if (matchingPayment && matchingPayment.consumed > 0) {
                     advanceAddedRows[index].consumed_amount = matchingPayment.consumed;
                     console.log(`Payment ${index + 1}: Payment=${matchingPayment.AdvancePayment}, Consumed=${matchingPayment.consumed}, Remaining=${matchingPayment.remaining}`);
@@ -228,7 +242,7 @@ exports.getPoolHistory = async (req, res) => {
                     console.log(`Payment ${index + 1}: Not consumed yet`);
                 }
             });
-            
+
             // Get advance payments used (from trips table)
             // Read advance_balance directly from trip_depos table for this specific depo
             // IMPORTANT: Only show if this specific depo actually used advance balance (advance_balance > 0)
@@ -266,7 +280,7 @@ exports.getPoolHistory = async (req, res) => {
                   AND ab.TripID IS NOT NULL
             `;
             const [advanceUsedRows] = await db.execute(advanceUsedQuery, [depoId, depoName, depoId]);
-            
+
             // Filter out rows where AdvancePayment is 0 or null, and convert to number
             const validAdvanceUsedRows = advanceUsedRows
                 .filter(row => row.AdvancePayment > 0)
@@ -275,14 +289,14 @@ exports.getPoolHistory = async (req, res) => {
                     AdvancePayment: parseFloat(row.AdvancePayment) || 0,
                     consumed_amount: parseFloat(row.consumed_amount) || 0
                 }));
-            
+
             // NOTE: Old "Advance Payment - TRIP-#" transactions from transactions table are NOT included
             // We now read advance usage directly from trip_depos.advance_balance
             // This prevents duplicate entries for consumed advance
-            
+
             // Combine additions and usages only (no old trip transactions)
             advanceRows = [...advanceAddedRows, ...validAdvanceUsedRows];
-            
+
             // Sort by date
             advanceRows.sort((a, b) => {
                 const dateA = a.transaction_date ? new Date(a.transaction_date) : new Date(0);
@@ -293,37 +307,37 @@ exports.getPoolHistory = async (req, res) => {
                 return (a.transaction_id || a.TripID || 0) - (b.transaction_id || b.TripID || 0);
             });
         }
-        
+
         // Combine pool entries and advance payments
         let allRows = [...poolRows, ...advanceRows];
-        
+
         // Sort chronologically: by date (CD for pool entries, Date for transactions), then by ID
         allRows.sort((a, b) => {
             let dateA, dateB;
-            
+
             if (a.is_advance_payment) {
                 dateA = a.transaction_date ? new Date(a.transaction_date) : new Date(0);
             } else {
                 // For pool entries, use CD (creation date)
                 dateA = a.pool_date ? new Date(a.pool_date) : new Date(0);
             }
-            
+
             if (b.is_advance_payment) {
                 dateB = b.transaction_date ? new Date(b.transaction_date) : new Date(0);
             } else {
                 // For pool entries, use CD (creation date)
                 dateB = b.pool_date ? new Date(b.pool_date) : new Date(0);
             }
-            
+
             // If both have dates, sort by date
             if (dateA.getTime() !== dateB.getTime() && dateA.getTime() !== 0 && dateB.getTime() !== 0) {
                 return dateA.getTime() - dateB.getTime();
             }
-            
+
             // If one has date and other doesn't, prioritize the one with date
             if (dateA.getTime() !== 0 && dateB.getTime() === 0) return -1;
             if (dateA.getTime() === 0 && dateB.getTime() !== 0) return 1;
-            
+
             // Both are pool entries or both are advance payments, sort by ID/transaction_id
             if (a.is_advance_payment && b.is_advance_payment) {
                 return (a.transaction_id || 0) - (b.transaction_id || 0);
@@ -334,7 +348,7 @@ exports.getPoolHistory = async (req, res) => {
                 return (a.transaction_id || a.ID || 0) - (b.transaction_id || b.ID || 0);
             }
         });
-        
+
         // Calculate DepoLimit for advance payments (they don't affect credit limit, so use previous pool entry's limit)
         let currentDepoLimit = null;
         for (let i = 0; i < allRows.length; i++) {
@@ -346,11 +360,11 @@ exports.getPoolHistory = async (req, res) => {
                 currentDepoLimit = allRows[i].DepoLimit;
             }
         }
-        
+
         // Build reason for each row
         const rowsWithReason = allRows.map(row => {
             let reason = '';
-            
+
             // Check if it's an advance payment
             if (row.is_advance_payment) {
                 reason = row.transaction_purpose || `Advance Payment Added`;
@@ -375,13 +389,13 @@ exports.getPoolHistory = async (req, res) => {
             else {
                 reason = 'Initial balance';
             }
-            
+
             return {
                 ...row,
                 Reason: reason
             };
         });
-        
+
         res.json(rowsWithReason);
     } catch (err) {
         console.error('Error fetching pool history:', err);
@@ -415,11 +429,11 @@ exports.getPool = async (req, res) => {
             WHERE p.ID = ? AND p.active = 1
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Pool not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching pool:', err);
@@ -430,6 +444,7 @@ exports.getPool = async (req, res) => {
 // Add new pool
 exports.addPool = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const {
             DepoID,
             Debit,
@@ -462,7 +477,7 @@ exports.addPool = async (req, res) => {
         }
 
         const currentDepoBalance = parseFloat(depoRows[0].Balance || 0);
-        
+
         // Calculate new depo balance: Debit adds, Credit subtracts
         let newDepoBalance = currentDepoBalance;
         if (debitAmount > 0) {
@@ -472,21 +487,23 @@ exports.addPool = async (req, res) => {
         }
 
         const query = `
-            INSERT INTO pool (DepoID, Debit, Credit, DepoLimit, active) 
-            VALUES (?, ?, ?, ?, 1)
+            INSERT INTO pool (DepoID, Debit, Credit, DepoLimit, active, CB, MB) 
+            VALUES (?, ?, ?, ?, 1, ?, ?)
         `;
 
         const [result] = await db.execute(query, [
             DepoID,
             debitAmount,
             creditAmount,
-            newDepoBalance
+            newDepoBalance,
+            auditUser,
+            auditUser
         ]);
 
         // Update depo balance
         await db.execute(
-            `UPDATE depo SET Balance = ?, updated_at = NOW() WHERE id = ?`,
-            [newDepoBalance, DepoID]
+            `UPDATE depo SET Balance = ?, MB = ?, MD = NOW() WHERE id = ?`,
+            [newDepoBalance, auditUser, DepoID]
         );
 
         res.json({
@@ -503,10 +520,93 @@ exports.addPool = async (req, res) => {
     }
 };
 
+// Persist a manual pool limit adjustment and keep depo balance in sync.
+exports.adjustPoolLimit = async (req, res) => {
+    const connection = await db.getConnection();
+
+    try {
+        const auditUser = resolveAuditUser(req);
+        const { DepoID, amount, action } = req.body;
+
+        if (!DepoID) {
+            connection.release();
+            return res.status(400).json({ message: 'Depo ID is required' });
+        }
+
+        const adjustmentAmount = parseFloat(amount) || 0;
+        if (adjustmentAmount <= 0) {
+            connection.release();
+            return res.status(400).json({ message: 'Amount must be greater than 0' });
+        }
+
+        if (action !== 'increase' && action !== 'decrease') {
+            connection.release();
+            return res.status(400).json({ message: 'Action must be either increase or decrease' });
+        }
+
+        await connection.beginTransaction();
+
+        const [depoRows] = await connection.execute(
+            'SELECT id, Balance FROM depo WHERE id = ? AND active = 1',
+            [DepoID]
+        );
+
+        if (depoRows.length === 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(404).json({ message: 'Depo not found' });
+        }
+
+        const currentBalance = parseFloat(depoRows[0].Balance || 0);
+        const isIncrease = action === 'increase';
+        const debitAmount = isIncrease ? 0 : adjustmentAmount;
+        const creditAmount = isIncrease ? adjustmentAmount : 0;
+        const newDepoLimit = isIncrease
+            ? currentBalance + adjustmentAmount
+            : currentBalance - adjustmentAmount;
+
+        if (newDepoLimit < 0) {
+            await connection.rollback();
+            connection.release();
+            return res.status(400).json({ message: 'Decrease amount cannot be greater than current depo balance' });
+        }
+
+        const [insertResult] = await connection.execute(
+            `INSERT INTO pool (DepoID, Debit, Credit, DepoLimit, active, CB, MB)
+             VALUES (?, ?, ?, ?, 1, ?, ?)`,
+            [DepoID, debitAmount, creditAmount, newDepoLimit, auditUser, auditUser]
+        );
+
+        await connection.execute(
+            'UPDATE depo SET Balance = ?, MB = ?, MD = NOW() WHERE id = ?',
+            [newDepoLimit, auditUser, DepoID]
+        );
+
+        await connection.commit();
+        connection.release();
+
+        res.json({
+            message: `Pool limit ${action}d successfully`,
+            id: insertResult.insertId,
+            DepoID,
+            Debit: debitAmount,
+            Credit: creditAmount,
+            DepoLimit: newDepoLimit,
+            Balance: newDepoLimit
+        });
+    } catch (err) {
+        await connection.rollback();
+        connection.release();
+        console.error('Error adjusting pool limit:', err);
+        res.status(500).json({ message: 'Server Error', error: err.message });
+    }
+};
+
 // Update pool - updates the first entry for depo_id and recalculates all rows
 exports.updatePool = async (req, res) => {
     const connection = await db.getConnection();
     try {
+        const auditUser = resolveAuditUser(req);
         const {
             ID,
             DepoID,
@@ -559,9 +659,11 @@ exports.updatePool = async (req, res) => {
         await connection.execute(
             `UPDATE pool SET 
                 Debit = ?,
-                Credit = ?
+                Credit = ?,
+                MB = ?,
+                MD = NOW()
             WHERE ID = ? AND active = 1`,
-            [debitAmount, creditAmount, firstPoolId]
+            [debitAmount, creditAmount, auditUser, firstPoolId]
         );
 
         // Get ALL records for this depo_id, ordered by ID (to recalculate from the beginning)
@@ -578,7 +680,7 @@ exports.updatePool = async (req, res) => {
         for (const pool of allPools) {
             const poolDebit = parseFloat(pool.Debit) || 0;
             const poolCredit = parseFloat(pool.Credit) || 0;
-            
+
             if (poolDebit > 0) {
                 runningLimit = runningLimit + poolDebit;
             } else if (poolCredit > 0) {
@@ -587,15 +689,15 @@ exports.updatePool = async (req, res) => {
 
             // Update DepoLimit for this record
             await connection.execute(
-                'UPDATE pool SET DepoLimit = ? WHERE ID = ?',
-                [runningLimit, pool.ID]
+                'UPDATE pool SET DepoLimit = ?, MB = ?, MD = NOW() WHERE ID = ?',
+                [runningLimit, auditUser, pool.ID]
             );
         }
 
         // Update depo balance to match the final running limit
         await connection.execute(
-            `UPDATE depo SET Balance = ?, updated_at = NOW() WHERE id = ?`,
-            [runningLimit, DepoID]
+            `UPDATE depo SET Balance = ?, MB = ?, MD = NOW() WHERE id = ?`,
+            [runningLimit, auditUser, DepoID]
         );
 
         await connection.commit();
@@ -614,6 +716,7 @@ exports.updatePool = async (req, res) => {
 // Delete pool (soft delete - set active = 0)
 exports.deletePool = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const { id } = req.body;
 
         if (!id) {
@@ -621,7 +724,7 @@ exports.deletePool = async (req, res) => {
         }
 
         // Soft delete: set active = 0 instead of deleting the record
-        const [result] = await db.execute('UPDATE pool SET active = 0 WHERE ID = ?', [id]);
+        const [result] = await db.execute('UPDATE pool SET active = 0, MB = ?, MD = NOW() WHERE ID = ?', [auditUser, id]);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Pool not found' });

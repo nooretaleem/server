@@ -1,11 +1,11 @@
 const db = require('../models/db');
 
-let resolvedVehicleTable = null;
+let resolvedVehicleTable = null; // reset if table name changes
 
 async function resolveVehicleTable() {
     if (resolvedVehicleTable) return resolvedVehicleTable;
-    const preferred = 'fuel_station_customer_vehicles';
-    const fallback = 'fuele_station_customer_vehicles';
+    const preferred = 'fuele_station_customer_vehicles';
+    const fallback = 'fuel_station_customer_vehicles';
     try {
         const [rows] = await db.execute(
             `SELECT table_name FROM information_schema.tables 
@@ -68,6 +68,7 @@ exports.addFuelStationCustomerVehicle = async (req, res) => {
             return res.status(400).json({ message: 'Vehicle number is required' });
         }
         const CB = req.body.CB || 'System';
+        const MB = req.body.MB || CB;
         if (!CB) {
             return res.status(400).json({ message: 'CB (Created By - username) is required' });
         }
@@ -81,15 +82,15 @@ exports.addFuelStationCustomerVehicle = async (req, res) => {
         }
 
         const [result] = await db.execute(
-            `INSERT INTO ${table} (customer_id, vehicle_number, Active, CB, CD, MD)
-             VALUES (?, ?, 1, ?, NOW(), NOW())`,
-            [customer_id, vehicle_number.trim(), CB]
+            `INSERT INTO ${table} (customer_id, vehicle_number, Active, CB, MB, CD, MD)
+             VALUES (?, ?, 1, ?, ?, NOW(), NOW())`,
+            [customer_id, vehicle_number.trim(), CB, MB]
         );
         res.json({ message: 'Vehicle added successfully', vehicle_id: result.insertId });
     } catch (err) {
         console.error('Error adding fuel station customer vehicle:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {
-            res.status(500).json({ message: 'fuel_station_customer_vehicles table does not exist. Please create the table first.' });
+            res.status(500).json({ message: 'fuele_station_customer_vehicles table does not exist. Please create the table first.' });
         } else {
             res.status(500).json({ message: 'Server Error', error: err.message });
         }

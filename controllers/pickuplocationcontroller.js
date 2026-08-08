@@ -1,5 +1,10 @@
 const db = require('../models/db');
 
+const resolveAuditUser = (req) => {
+    const payload = req.body || {};
+    return payload.MB || payload.CB || payload.userName || payload.username || payload.UserName || payload.createdBy || payload.modifiedBy || 'System';
+};
+
 // Get all pick up locations
 exports.getPickUpLocations = async (req, res) => {
     try {
@@ -38,11 +43,11 @@ exports.getPickUpLocation = async (req, res) => {
             WHERE id = ?
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Pick up location not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching pick up location:', err);
@@ -57,6 +62,7 @@ exports.addPickUpLocation = async (req, res) => {
         const {
             name
         } = req.body;
+        const auditUser = resolveAuditUser(req);
 
         if (!name) {
             connection.release();
@@ -67,12 +73,14 @@ exports.addPickUpLocation = async (req, res) => {
 
         // Insert into pick_up_location table
         const query = `
-            INSERT INTO pick_up_location (name, CD, MD) 
-            VALUES (?, NOW(), NOW())
+            INSERT INTO pick_up_location (name, CB, MB, CD, MD) 
+            VALUES (?, ?, ?, NOW(), NOW())
         `;
 
         const [result] = await connection.execute(query, [
-            name
+            name,
+            auditUser,
+            auditUser
         ]);
 
         await connection.commit();
@@ -102,6 +110,7 @@ exports.updatePickUpLocation = async (req, res) => {
             id,
             name
         } = req.body;
+        const MB = resolveAuditUser(req);
 
         if (!id) {
             connection.release();
@@ -116,12 +125,13 @@ exports.updatePickUpLocation = async (req, res) => {
 
         const query = `
             UPDATE pick_up_location 
-            SET name = ?, MD = NOW() 
+            SET name = ?, MB = ?, MD = NOW() 
             WHERE id = ?
         `;
 
         const [result] = await connection.execute(query, [
             name,
+            MB,
             id
         ]);
 
@@ -148,6 +158,7 @@ exports.deletePickUpLocation = async (req, res) => {
     const connection = await db.getConnection();
     try {
         const { id } = req.body;
+        const MB = resolveAuditUser(req);
 
         if (!id) {
             connection.release();
@@ -163,6 +174,11 @@ exports.deletePickUpLocation = async (req, res) => {
             connection.release();
             return res.status(404).json({ message: 'Pick up location not found' });
         }
+
+        await connection.execute(
+            'UPDATE pick_up_location SET MB = ?, MD = NOW() WHERE id = ?',
+            [MB, id]
+        );
 
         // Hard delete
         const [result] = await connection.execute(

@@ -3,45 +3,27 @@ const db = require('../models/db');
 // Get all fuel station customers
 exports.getFuelStationCustomers = async (req, res) => {
     try {
-        const customerName = req.query.customer_name;
-        const phoneNumber = req.query.phone_number;
-        const customerType = req.query.customer_type;
-
-        let query = `
-            SELECT 
-                customer_id,
-                customer_name,
-                phone_number,
-                customer_type,
-                CB,
-                CD,
-                MB,
-                MD,
-                Active
-            FROM fuel_station_customer
-            WHERE Active = 1
-        `;
-        const params = [];
-
-        if (customerName) {
-            query += ' AND customer_name LIKE ?';
-            params.push(`%${customerName}%`);
-        }
-        if (phoneNumber) {
-            query += ' AND phone_number LIKE ?';
-            params.push(`%${phoneNumber}%`);
-        }
-        if (customerType) {
-            query += ' AND customer_type = ?';
-            params.push(customerType);
-        }
-
-        query += ' ORDER BY customer_name';
-
-        const [rows] = await db.execute(query, params);
+        const query = `SELECT * FROM fuel_station_customer WHERE Active = 1 ORDER BY customer_name`;
+        const [rows] = await db.execute(query);
+        console.log('Fetched fuel station customers:', rows);
         res.json(rows);
     } catch (err) {
         console.error('Error fetching fuel station customers:', err);
+        if (err.code === 'ER_NO_SUCH_TABLE') {
+            res.json([]);
+        } else {
+            res.status(500).json({ message: 'Server Error', error: err.message });
+        }
+    }
+};
+
+exports.getLocalCustomers = async (req, res) => {
+    try {
+        const query = `SELECT * FROM fuel_station_customer WHERE Active = 1 ORDER BY customer_name`;
+        const [rows] = await db.execute(query);
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching local customers:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {
             res.json([]);
         } else {
@@ -91,7 +73,8 @@ exports.addFuelStationCustomer = async (req, res) => {
         const {
             customer_name,
             phone_number,
-            customer_type
+            customer_type,
+            Previous_Dues
         } = req.body;
 
         if (!customer_name || !customer_name.trim()) {
@@ -127,20 +110,23 @@ exports.addFuelStationCustomer = async (req, res) => {
         if (!CB) {
             return res.status(400).json({ message: 'CB (Created By - username) is required' });
         }
+        const MB = req.body.MB || CB;
 
         const query = `
             INSERT INTO fuel_station_customer (
-                customer_name, phone_number, customer_type,
-                Active, CB, CD, MD
+                customer_name, phone_number, customer_type, Previous_Dues,
+                Active, CB, CD, MB, MD
             ) 
-            VALUES (?, ?, ?, 1, ?, NOW(), NOW())
+            VALUES (?, ?, ?, ?, 1, ?, NOW(), ?, NOW())
         `;
 
         const [result] = await db.execute(query, [
             customer_name.trim(),
             phone_number.trim(),
             customer_type.trim(),
-            CB
+            Previous_Dues || 0,
+            CB,
+            MB
         ]);
 
         res.json({
@@ -167,6 +153,7 @@ exports.updateFuelStationCustomer = async (req, res) => {
             customer_name,
             phone_number,
             customer_type,
+            Previous_Dues,
             Active,
             active
         } = req.body;
@@ -214,6 +201,7 @@ exports.updateFuelStationCustomer = async (req, res) => {
                 customer_name = ?,
                 phone_number = ?,
                 customer_type = ?,
+                Previous_Dues = ?,
                 Active = ?,
                 MB = ?,
                 MD = NOW()
@@ -224,6 +212,7 @@ exports.updateFuelStationCustomer = async (req, res) => {
             customer_name.trim(),
             phone_number.trim(),
             customer_type.trim(),
+            Previous_Dues || 0,
             activeValue ? 1 : 0,
             MB,
             customer_id
@@ -271,11 +260,15 @@ exports.deleteFuelStationCustomer = async (req, res) => {
 exports.getPetrolPumps = async (req, res) => {
 
     try {
+
+
         const query = `
             SELECT 
                 id,
-                name
+                name,
+                manager_id
             FROM petrol_pumps
+            WHERE Active = 1
             ORDER BY name
         `;
 

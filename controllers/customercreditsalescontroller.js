@@ -1,5 +1,10 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return b.MB || b.CB || b.userName || b.username || b.UserName || b.createdBy || b.modifiedBy || 'System';
+}
+
 // Normalize sale_date to YYYY-MM-DD so it matches daily_sales_summary (e.g. accept dd-MM-yyyy from UI)
 function normalizeSaleDate(input) {
     if (!input || typeof input !== 'string') return '';
@@ -50,6 +55,58 @@ async function resolveVehicleTable() {
         resolvedVehicleTable = preferred;
     }
     return resolvedVehicleTable;
+}
+
+async function ensureRecoverySchema(run) {
+    const safeAlter = async (sql) => {
+        try {
+            await run(sql);
+        } catch (err) {
+            if (err.code !== 'ER_DUP_FIELDNAME' && err.code !== 'ER_DUP_KEYNAME') {
+                throw err;
+            }
+        }
+    };
+
+    // customer_ledger must store recovery metadata
+    await safeAlter(`ALTER TABLE customer_ledger ADD COLUMN received_in VARCHAR(100) NULL`);
+    await safeAlter(`ALTER TABLE customer_ledger ADD COLUMN purpose VARCHAR(500) NULL`);
+
+    // cash-in-hand ledger table for station recoveries
+    await run(
+        `CREATE TABLE IF NOT EXISTS station_cash_in_hand (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            customer_id INT NOT NULL,
+            ref_type VARCHAR(50) NULL,
+            received_in VARCHAR(100) NULL,
+            purpose VARCHAR(500) NULL,
+            debit DECIMAL(12,2) DEFAULT 0,
+            credit DECIMAL(12,2) DEFAULT 0,
+            balance DECIMAL(12,2) DEFAULT 0,
+            entry_date DATE NULL,
+            CB VARCHAR(50) NULL,
+            MB VARCHAR(50) NULL,
+            CD DATETIME NULL,
+            MD DATETIME NULL,
+            active TINYINT(4) DEFAULT 1,
+            INDEX idx_scih_customer (customer_id),
+            INDEX idx_scih_entry_date (entry_date)
+        )`
+    );
+
+    /* await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN ref_type VARCHAR(50) NULL`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN received_in VARCHAR(100) NULL`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN purpose VARCHAR(500) NULL`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN entry_date DATE NULL`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN active TINYINT(4) DEFAULT 1`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN CB VARCHAR(50) NULL`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN MB VARCHAR(50) NULL`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN CD DATETIME NULL`);
+    await safeAlter(`ALTER TABLE station_cash_in_hand ADD COLUMN MD DATETIME NULL`); */
+
+
+
+
 }
 
 // Get total fuel sold and max allowed credit quantity for a station/fuel type/date (for Add Credit Sale form)
@@ -129,9 +186,33 @@ exports.getCustomerCreditSales = async (req, res) => {
             ORDER BY cs.cd DESC, cs.id DESC
         `;
         const [rows] = await db.execute(query, [customerId]);
+
         res.json(rows);
     } catch (err) {
         console.error('Error fetching customer credit sales:', err);
+        if (err.code === 'ER_NO_SUCH_TABLE') {
+            res.json([]);
+        } else {
+            res.status(500).json({ message: 'Server Error', error: err.message });
+        }
+    }
+};
+
+exports.getLocalCustomersRecoveryHistory = async (req, res) => {
+    try {
+        const customerId = req.query.customer_id;
+        if (!customerId) {
+            return res.status(400).json({ message: 'Customer ID is required' });
+        }
+        const [rows] = await db.execute(
+            `SELECT amount,recovery_date,payment_mode,CD
+             FROM fuel_station_customer_recoveries
+             WHERE customer_id = ? AND Active = 1`,
+            [customerId]
+        );
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching local customer recovery history:', err);
         if (err.code === 'ER_NO_SUCH_TABLE') {
             res.json([]);
         } else {
@@ -167,6 +248,140 @@ exports.getCustomerRecoveryTotal = async (req, res) => {
     }
 };
 
+// Get total due for a customer.
+// fuel_station_customer_id: due from latest customer_ledger balance so ledger-only debits are included
+// ws_customer_id: due from POL trip sales + credit_sales.remaining_amount
+exports.getCustomerCreditDue = async (req, res) => {
+    try {
+        const { fuel_station_customer_id, ws_customer_id } = req.query;
+        if (!fuel_station_customer_id && !ws_customer_id) {
+            return res.status(400).json({ message: 'fuel_station_customer_id or ws_customer_id is required' });
+        }
+
+        if (fuel_station_customer_id) {
+            // 1. Previous dues
+            const [fs_previousDuesRows] = await db.execute(
+                `SELECT COALESCE(previous_dues, 0) AS previous_dues
+         FROM fuel_station_customer
+         WHERE customer_id = ? AND Active = 1`,
+                [fuel_station_customer_id]
+            );
+
+            const previousDues = parseFloat(fs_previousDuesRows?.[0]?.previous_dues || 0);
+
+            // 2. Credit sales total
+            const [creditRows] = await db.execute(
+                `SELECT COALESCE(SUM(total_amount), 0) AS credit_total
+         FROM credit_sales
+         WHERE fuel_station_customer_id = ? AND Active = 1`,
+                [fuel_station_customer_id]
+            );
+            const creditTotal = parseFloat(creditRows?.[0]?.credit_total || 0);
+
+            // 3. Payments / recoveries
+            const [paymentRows] = await db.execute(
+                `SELECT COALESCE(SUM(Amount), 0) AS paid_total
+         FROM recoveries
+         WHERE ClientID = ? AND Active = 1`,
+                [fuel_station_customer_id]
+            );
+
+            const paidTotal = parseFloat(paymentRows?.[0]?.paid_total || 0);
+
+
+            // 4. Final calculation
+            const fuelStationDue =
+                previousDues + creditTotal - paidTotal;
+
+            return res.json({
+                total_due: Math.max(0, fuelStationDue),
+                fuel_station_due: Math.max(0, fuelStationDue),
+                trip_due: 0
+            });
+            /*  const [ledgerRows] = await db.execute(
+                 `SELECT balance
+                  FROM customer_ledger
+                  WHERE customer_id = ? AND Active = 1
+                  ORDER BY id DESC
+                  LIMIT 1`,
+                 [fuel_station_customer_id]
+             );
+             const fuelStationDue = ledgerRows && ledgerRows[0]
+                 ? Math.max(0, parseFloat(ledgerRows[0].balance) || 0)
+                 : 0;
+ 
+             return res.json({ total_due: fuelStationDue, fuel_station_due: fuelStationDue, trip_due: 0 }); */
+        } else {
+            // 1) Trip due from POL sales formula used in customers list
+            //    trip_due = Previous_Dues + max(0, total_sales - max(0, total_recoveries - Previous_Dues))
+            const [tripRows] = await db.execute(
+                `SELECT
+                    (
+                        COALESCE(c.Previous_Dues, 0) +
+                        GREATEST(0,
+                            COALESCE(sales.total_amount, 0) -
+                            GREATEST(0, COALESCE(recoveries.total_paid, 0) - COALESCE(c.Previous_Dues, 0))
+                        )
+                    ) AS trip_due
+                 FROM customers c
+                 LEFT JOIN (
+                    SELECT client_id, SUM(total_amount) AS total_amount
+                    FROM pol_sale
+                    WHERE Active = 1
+                    GROUP BY client_id
+                 ) sales ON sales.client_id = c.id
+                 LEFT JOIN (
+                    SELECT ClientID, SUM(Amount) AS total_paid
+                    FROM recoveries
+                    WHERE Active = 1
+                    GROUP BY ClientID
+                 ) recoveries ON recoveries.ClientID = c.id
+                 WHERE c.id = ? AND c.active = 1`,
+                [ws_customer_id]
+            );
+
+            // 2) Fuel-station due from supplier credit sales
+            /*   const [creditRows] = await db.execute(
+                  `SELECT COALESCE(SUM(remaining_amount), 0) AS fuel_station_due
+                   FROM credit_sales
+                   WHERE ws_customer_id = ? AND Active = 1 AND remaining_amount > 0`,
+                  [ws_customer_id]
+              ); */
+
+            // 2. Credit sales total
+            const [creditRows] = await db.execute(
+                `SELECT COALESCE(SUM(total_amount), 0) AS fuel_station_due
+         FROM credit_sales
+         WHERE ws_customer_id = ? AND Active = 1`,
+                [ws_customer_id]
+            );
+            const creditTotal = parseFloat(creditRows?.[0]?.credit_total || 0);
+
+
+            // 3. Recoveries total
+            const [recoveriesRows] = await db.execute(
+                `SELECT COALESCE(SUM(amount), 0) AS fuel_station_recveries
+         FROM fuel_station_customer_recoveries
+         WHERE station_id = ? AND Active = 1`,
+                [ws_customer_id]
+            );
+            const tripDue = tripRows && tripRows[0] ? parseFloat(tripRows[0].trip_due) || 0 : 0;
+            const fuelStationDue = creditRows && creditRows[0] ? parseFloat(creditRows[0].fuel_station_due) || 0 : 0;
+            const fuelStationRecoveries = recoveriesRows && recoveriesRows[0] ? parseFloat(recoveriesRows[0].fuel_station_recveries) || 0 : 0;
+
+            const totalDue = tripDue + fuelStationDue - fuelStationRecoveries;
+            return res.json({ total_due: totalDue, trip_due: tripDue, fuel_station_due: fuelStationDue });
+        }
+    } catch (err) {
+        console.error('Error fetching customer credit due:', err);
+        if (err.code === 'ER_NO_SUCH_TABLE') {
+            res.json({ total_due: 0, trip_due: 0, fuel_station_due: 0 });
+        } else {
+            res.status(500).json({ message: 'Server Error', error: err.message });
+        }
+    }
+};
+
 // Add credit sale: insert customer_credit_sales, post to customer_ledger (debit), update daily_sales_summary
 exports.addCustomerCreditSale = async (req, res) => {
     const connection = await db.getConnection ? await db.getConnection() : null;
@@ -195,7 +410,7 @@ exports.addCustomerCreditSale = async (req, res) => {
         }
 
         const dateOnly = (sale_date + '').split('T')[0].split(' ')[0];
-        const CB = req.body.CB || 'System';
+        const CB = resolveAuditUser(req);
 
         // Load current rate from fuel_rates for this fuel type and date
         const [rateRows] = await run(
@@ -257,18 +472,18 @@ exports.addCustomerCreditSale = async (req, res) => {
         let insertSaleQuery = `
             INSERT INTO customer_credit_sales (
                 customer_id, station_id, fuel_type, sale_date, quantity, rate, amount, is_settled,
-                CB, CD, MD, Active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NOW(), NOW(), 1)
+                CB, MB, CD, MD, Active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW(), NOW(), 1)
         `;
-        let insertParams = [customer_id, station_id, fuel_type_id, sale_date, qty, effectiveRate, amt, CB];
+        let insertParams = [customer_id, station_id, fuel_type_id, sale_date, qty, effectiveRate, amt, CB, CB];
         if (vehicleColumn) {
             insertSaleQuery = `
                 INSERT INTO customer_credit_sales (
                     customer_id, station_id, fuel_type, sale_date, quantity, rate, amount, is_settled,
-                    ${vehicleColumn}, CB, CD, MD, Active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW(), NOW(), 1)
+                    ${vehicleColumn}, CB, MB, CD, MD, Active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NOW(), NOW(), 1)
             `;
-            insertParams = [customer_id, station_id, fuel_type_id, sale_date, qty, effectiveRate, amt, vehicleValue, CB];
+            insertParams = [customer_id, station_id, fuel_type_id, sale_date, qty, effectiveRate, amt, vehicleValue, CB, CB];
         }
         const [saleResult] = await run(insertSaleQuery, insertParams);
         const creditSaleId = saleResult.insertId;
@@ -285,10 +500,10 @@ exports.addCustomerCreditSale = async (req, res) => {
 
         // 3) Insert customer_ledger (debit)
         const ledgerInsert = `
-            INSERT INTO customer_ledger (customer_id, ref_type, ref_id, debit, credit, balance, CB, CD, MD, Active)
-            VALUES (?, 'credit_sale', ?, ?, 0, ?, ?, NOW(), NOW(), 1)
+            INSERT INTO customer_ledger (customer_id, ref_type, debit, credit, balance, CB, MB, CD, MD, Active)
+            VALUES (?, 'credit_sale', ?, 0, ?, ?, ?, NOW(), NOW(), 1)
         `;
-        await run(ledgerInsert, [customer_id, creditSaleId, amt, newBalance, CB]);
+        await run(ledgerInsert, [customer_id, amt, newBalance, CB, CB]);
 
         // 4) Update daily_sales_summary: add to credit_sale, subtract from cash_sale for this date/station/fuel
         const summaryId = summaryRows[0].id;
@@ -354,9 +569,11 @@ exports.addCustomerRecovery = async (req, res) => {
             return res.status(400).json({ message: 'Customer ID and amount are required' });
         }
         const amt = Math.abs(parseFloat(amount));
-        const CB = req.body.CB || 'System';
-        const isCash = (received_in || '').toLowerCase() === 'cash_in_hand';
-        const isBank = (received_in || '').toLowerCase() === 'bank_account';
+        const CB = resolveAuditUser(req);
+        const receivedInNorm = (received_in || '').toLowerCase();
+        const isCash = receivedInNorm === 'cash_in_hand';
+        const isBank = receivedInNorm === 'bank_account';
+        const paymentMode = isCash ? 'Cash' : isBank ? 'Bank' : (received_in || null);
 
         if (isCash && !station_id) {
             return res.status(400).json({ message: 'Station ID is required when receiving in Cash in Hand' });
@@ -365,8 +582,12 @@ exports.addCustomerRecovery = async (req, res) => {
             return res.status(400).json({ message: 'Account is required when receiving in Bank Account' });
         }
 
-        if (useTransaction) await connection.beginTransaction();
         const run = connection ? connection.execute.bind(connection) : db.execute.bind(db);
+
+        // Auto-heal schema before inserts to avoid production failures.
+        await ensureRecoverySchema(run);
+
+        if (useTransaction) await connection.beginTransaction();
 
         // 1) Customer ledger
         const [lastLedger] = await run(
@@ -376,9 +597,9 @@ exports.addCustomerRecovery = async (req, res) => {
         const prevBalance = lastLedger.length > 0 ? parseFloat(lastLedger[0].balance) || 0 : 0;
         const newBalance = prevBalance + amt;
         await run(
-            `INSERT INTO customer_ledger (customer_id, ref_type, debit, credit, balance, received_in, purpose, CB, CD, MD, Active)
-             VALUES (?, 'recovery', 0, ?, ?, ?, ?, ?, NOW(), NOW(), 1)`,
-            [customer_id, amt, newBalance, received_in || null, purpose || null, CB]
+            `INSERT INTO customer_ledger (customer_id, ref_type, debit, credit, balance, received_in, purpose, CB, MB, CD, MD, Active)
+             VALUES (?, 'recovery', 0, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)`,
+            [customer_id, amt, newBalance, received_in || null, purpose || null, CB, CB]
         );
 
         let transactionId = null;
@@ -394,9 +615,9 @@ exports.addCustomerRecovery = async (req, res) => {
             const prevCashBalance = lastCash.length > 0 ? parseFloat(lastCash[0].balance) || 0 : 0;
             const newCashBalance = prevCashBalance + amt;
             await run(
-                `INSERT INTO station_cash_in_hand (customer_id, debit, credit, balance, purpose, entry_date, CB, CD, MD, MB, active)
-                 VALUES (?, 0, ?, ?, ?, ?, ?, NOW(), NOW(), ?, 1)`,
-                [customer_id, amt, newCashBalance, purposeText, recDate, CB, CB]
+                `INSERT INTO station_cash_in_hand (customer_id, ref_type, received_in, debit, credit, balance, purpose, entry_date, CB, CD, MD, MB, active)
+                 VALUES (?, 'RECOVERY', ?, 0, ?, ?, ?, ?, ?, NOW(), NOW(), ?, 1)`,
+                [customer_id, received_in || null, amt, newCashBalance, purposeText, recDate, CB, CB]
             );
             // 3a) transactions (audit; AccountID may be NULL for station cash)
             const [txResult] = await run(
@@ -427,7 +648,7 @@ exports.addCustomerRecovery = async (req, res) => {
         await run(
             `INSERT INTO fuel_station_customer_recoveries (customer_id, station_id, transactionID, recovery_date, amount, payment_mode, reference, CB, MB, CD, MD, Active)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)`,
-            [customer_id, station_id || null, transactionId, recDate, amt, received_in || null, purposeText || null, CB, CB]
+            [customer_id, station_id || null, transactionId, recDate, amt, paymentMode, purposeText || null, CB, CB]
         );
 
         // 5) FIFO Payment Allocation: Apply recovery amount to oldest credit sales

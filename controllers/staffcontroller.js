@@ -5,12 +5,15 @@ const bcrypt = require('bcrypt');
 exports.getStaff = async (req, res) => {
     try {
         const query = `
-            SELECT id, staffCode, name, phone, designation, employmentType,
-                   joiningDate, user_id, pump_id, cnic, salary,
-                   cd, md, CB, MB, Active
-            FROM staff
-            WHERE Active = 1
-            ORDER BY name
+                SELECT s.id, s.staffCode, s.name, s.phone, s.designation, s.role, s.employmentType,
+                   s.joiningDate, s.user_id,
+                    s.pump_id AS pump_id,
+                   s.cnic, s.salary,
+                   s.cd, s.md, s.CB, s.MB, s.Active
+            FROM staff s
+
+            WHERE s.Active = 1
+            ORDER BY s.name
         `;
         const [rows] = await db.execute(query);
         res.json(rows);
@@ -33,7 +36,7 @@ exports.getStaffById = async (req, res) => {
         }
 
         const query = `
-            SELECT s.id, s.staffCode, s.name, s.phone, s.designation, s.employmentType,
+                 SELECT s.id, s.staffCode, s.name, s.phone, s.designation, s.role, s.employmentType,
                    s.joiningDate, s.user_id, s.pump_id, s.cnic, s.salary,
                    s.cd, s.md, s.CB, s.MB, s.Active, u.email, u.roleid
             FROM staff s
@@ -62,6 +65,7 @@ exports.addStaff = async (req, res) => {
             phone,
             designation,
             employmentType,
+            role,
             joiningDate,
             email,
             password,
@@ -103,6 +107,14 @@ exports.addStaff = async (req, res) => {
         if (!employmentType || !employmentType.trim()) {
             return res.status(400).json({ message: 'Employment type is required' });
         }
+        const normalizedRole = String(role || '').trim();
+        if (!normalizedRole) {
+            return res.status(400).json({ message: 'Role is required' });
+        }
+        const allowedRoles = ['cashier', 'staff', 'filler', 'supervisor', 'accountant', 'security guard', 'cleaner'];
+        if (!allowedRoles.includes(normalizedRole.toLowerCase())) {
+            return res.status(400).json({ message: 'Role must be one of: Cashier, Staff, Filler, Supervisor, Accountant, Security Guard, Cleaner' });
+        }
         if (!joiningDate || !joiningDate.trim()) {
             return res.status(400).json({ message: 'Joining date is required' });
         }
@@ -125,8 +137,8 @@ exports.addStaff = async (req, res) => {
             // Create user (CB = Created By, CD = Created Date)
             const hashedPassword = await bcrypt.hash(passwordVal, 10);
             const [userResult] = await db.execute(
-                'INSERT INTO users (name, email, password, roleid, CB, CD) VALUES (?, ?, ?, ?, ?, NOW())',
-                [name.trim(), emailVal, hashedPassword, roleId, createdBy]
+                'INSERT INTO users (name, email, password, roleid, CB, CD, MB) VALUES (?, ?, ?, ?, ?, NOW(), ?)',
+                [name.trim(), emailVal, hashedPassword, roleId, createdBy, createdBy]
             );
             userId = userResult.insertId;
         }
@@ -135,9 +147,9 @@ exports.addStaff = async (req, res) => {
         const query = `
             INSERT INTO staff (
                 staffCode, name, phone, designation, employmentType,
-                joiningDate, user_id, pump_id, cnic, salary,
+                joiningDate, role, user_id, pump_id, cnic, salary,
                 Active, CB, CD, MB, MD
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NOW(), ?, NOW())
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NOW(), ?, NOW())
         `;
 
         const [result] = await db.execute(query, [
@@ -147,6 +159,7 @@ exports.addStaff = async (req, res) => {
             designation.trim(),
             employmentType.trim(),
             joiningDate,
+            normalizedRole.charAt(0).toUpperCase() + normalizedRole.slice(1).toLowerCase(),
             userId,
             pumpId,
             cnic ? cnic.trim() : null,
@@ -181,6 +194,7 @@ exports.updateStaff = async (req, res) => {
             phone,
             designation,
             employmentType,
+            role,
             joiningDate,
             user_id,
             email,
@@ -214,6 +228,14 @@ exports.updateStaff = async (req, res) => {
         }
         if (!employmentType || !employmentType.trim()) {
             return res.status(400).json({ message: 'Employment type is required' });
+        }
+        const normalizedRole = String(role || '').trim();
+        if (!normalizedRole) {
+            return res.status(400).json({ message: 'Role is required' });
+        }
+        const allowedRoles = ['cashier', 'staff', 'filler', 'supervisor', 'accountant', 'security guard', 'cleaner'];
+        if (!allowedRoles.includes(normalizedRole.toLowerCase())) {
+            return res.status(400).json({ message: 'Role must be one of: Cashier, Staff, Filler, Supervisor, Accountant, Security Guard, Cleaner' });
         }
         if (!joiningDate || !joiningDate.trim()) {
             return res.status(400).json({ message: 'Joining date is required' });
@@ -250,7 +272,7 @@ exports.updateStaff = async (req, res) => {
         const query = `
             UPDATE staff SET
                 staffCode = ?, name = ?, phone = ?, designation = ?,
-                employmentType = ?, joiningDate = ?, user_id = ?,
+                employmentType = ?, joiningDate = ?, role = ?, user_id = ?,
                 pump_id = ?, cnic = ?, salary = ?, Active = ?,
                 MB = ?, MD = NOW()
             WHERE id = ?
@@ -263,6 +285,7 @@ exports.updateStaff = async (req, res) => {
             designation.trim(),
             employmentType.trim(),
             joiningDate,
+            normalizedRole.charAt(0).toUpperCase() + normalizedRole.slice(1).toLowerCase(),
             userId,
             pumpId,
             cnic ? cnic.trim() : null,
@@ -287,21 +310,39 @@ exports.updateStaff = async (req, res) => {
 exports.getStaffAdvanceHistory = async (req, res) => {
     try {
         const staffId = req.query.staff_id;
+        const startDate = req.query.startDate;
+        const endDate = req.query.endDate;
         if (!staffId) {
             return res.status(400).json({ message: 'Staff ID is required' });
         }
 
-        const [rows] = await db.execute(
-            `SELECT id, staff_id, credit, debit, reason, CB, MB, cd, md
-             FROM staff_advance_salary
-             WHERE staff_id = ? AND Active = 1
-             ORDER BY cd DESC, id DESC`,
-            [staffId]
-        );
+        let query = `SELECT sas.id, sas.staff_id, sas.pump_id, s.name AS staff_name, sas.credit, sas.debit, sas.reason, sas.CB, sas.MB, sas.cd, sas.md
+             FROM staff_advance_salary sas
+             INNER JOIN staff s ON s.id = sas.staff_id
+             WHERE sas.staff_id = ? AND sas.Active = 1
+             AND MONTH(sas.cd) = MONTH(CURRENT_DATE())
+             AND YEAR(sas.cd) = YEAR(CURRENT_DATE())`;
+        const params = [staffId];
+
+        if (startDate) {
+            query += ' AND DATE(sas.cd) >= ?';
+            params.push(startDate);
+        }
+
+        if (endDate) {
+            query += ' AND DATE(sas.cd) <= ?';
+            params.push(endDate);
+        }
+
+        query += ' ORDER BY sas.cd DESC, sas.id DESC';
+
+        const [rows] = await db.execute(query, params);
 
         const history = (rows || []).map(r => ({
             id: r.id,
             staff_id: r.staff_id,
+            pump_id: r.pump_id != null ? Number(r.pump_id) : null,
+            staff_name: r.staff_name,
             credit: r.credit != null ? parseFloat(r.credit) : 0,
             debit: r.debit != null ? parseFloat(r.debit) : 0,
             reason: r.reason || null,
@@ -348,11 +389,19 @@ exports.getStaffAdvanceBalance = async (req, res) => {
 
 // Add debit/credit to staff_advance_salary
 exports.addStaffAdvanceRecord = async (req, res) => {
+    let connection;
     try {
-        const { staff_id, credit, debit, reason, CB, MB } = req.body;
+        const { staff_id, credit, debit, pump_id, reason, CB, MB } = req.body;
 
         if (!staff_id) {
             return res.status(400).json({ message: 'Staff ID is required' });
+        }
+        if (!pump_id) {
+            return res.status(400).json({ message: 'Pump ID is required' });
+        }
+        const pumpId = parseInt(pump_id, 10);
+        if (!Number.isFinite(pumpId) || pumpId <= 0) {
+            return res.status(400).json({ message: 'Pump ID must be a valid number' });
         }
         const creditVal = parseFloat(credit) || 0;
         const debitVal = parseFloat(debit) || 0;
@@ -364,19 +413,63 @@ exports.addStaffAdvanceRecord = async (req, res) => {
         }
 
         // Validate reason length (max 200 characters)
-        const reasonVal = reason ? reason.trim().substring(0, 200) : null;
+        const reasonVal = reason ? reason.trim().substring(0, 200) : 'Advance Salary';
 
         const cb = CB || req.body.CB || 'System';
         const mb = MB || req.body.MB || cb;
 
-        await db.execute(
-            `INSERT INTO staff_advance_salary (staff_id, credit, debit, reason, CB, MB, cd, md, Active)
-             VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)`,
-            [staff_id, creditVal, debitVal, reasonVal, cb, mb]
+        connection = await db.getConnection();
+        await connection.beginTransaction();
+
+        const [latestCashRows] = await connection.execute(
+            `SELECT id FROM cash_management ORDER BY id DESC LIMIT 1`
         );
+        if (!latestCashRows || latestCashRows.length === 0) {
+            await connection.rollback();
+            return res.status(400).json({ message: 'No cash found to link this transaction.' });
+        }
+
+        const latestCashManagementId = Number(latestCashRows[0].id);
+
+        await connection.execute(
+            `INSERT INTO staff_advance_salary (staff_id, pump_id, cash_management_id, credit, debit, reason, CB, MB, cd, md, Active)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 1)`,
+            [staff_id, pumpId, latestCashManagementId, creditVal, debitVal, reasonVal, cb, mb]
+        );
+
+        if (debitVal > 0) {
+            await connection.execute(
+                `UPDATE cash_management
+                 SET total_cash_outflow = COALESCE(total_cash_outflow, 0) + ?,
+                     md = NOW(),
+                     MB = ?
+                 WHERE id = ?`,
+                [debitVal, mb, latestCashManagementId]
+            );
+        }
+
+        if (creditVal > 0) {
+            await connection.execute(
+                `UPDATE cash_management
+                 SET other_income = COALESCE(other_income, 0) + ?,
+                     md = NOW(),
+                     MB = ?
+                 WHERE id = ?`,
+                [creditVal, mb, latestCashManagementId]
+            );
+        }
+
+        await connection.commit();
+        connection.release();
+        connection = null;
 
         res.json({ message: 'Record saved successfully' });
     } catch (err) {
+        if (connection) {
+            try { await connection.rollback(); } catch (_) { }
+            connection.release();
+            connection = null;
+        }
         if (err.code === 'ER_NO_SUCH_TABLE') {
             return res.status(500).json({ message: 'staff_advance_salary table does not exist. Please create it first.' });
         }

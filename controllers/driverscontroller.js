@@ -1,5 +1,19 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return (
+        b.MB ||
+        b.CB ||
+        b.userName ||
+        b.username ||
+        b.UserName ||
+        b.createdBy ||
+        b.modifiedBy ||
+        'System'
+    ).toString().trim() || 'System';
+}
+
 // Get all drivers
 exports.getDrivers = async (req, res) => {
     try {
@@ -11,9 +25,12 @@ exports.getDrivers = async (req, res) => {
                 license_number,
                 address,
                 is_active,
+                CB,
+                MB,
                 created_at,
                 updated_at
             FROM drivers
+            WHERE is_active = 1
             ORDER BY name
         `;
         const [rows] = await db.execute(query);
@@ -36,13 +53,13 @@ exports.getDriver = async (req, res) => {
             return res.status(400).json({ message: 'Driver ID is required' });
         }
 
-        const query = 'SELECT * FROM drivers WHERE id = ?';
+        const query = 'SELECT * FROM drivers WHERE id = ? AND is_active = 1';
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Driver not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching driver:', err);
@@ -65,9 +82,11 @@ exports.addDriver = async (req, res) => {
             return res.status(400).json({ message: 'Driver name is required' });
         }
 
+        const auditUser = resolveAuditUser(req);
+
         const query = `
-            INSERT INTO drivers (name, phone, license_number, address, is_active) 
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO drivers (name, phone, license_number, address, is_active, CB, MB) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         `;
 
         const [result] = await db.execute(query, [
@@ -75,7 +94,9 @@ exports.addDriver = async (req, res) => {
             phone || null,
             license_number || null,
             address || null,
-            typeof is_active === 'number' ? is_active : (is_active ? 1 : 0)
+            typeof is_active === 'number' ? is_active : (is_active ? 1 : 0),
+            auditUser,
+            auditUser
         ]);
 
         res.json({
@@ -111,6 +132,8 @@ exports.updateDriver = async (req, res) => {
             return res.status(400).json({ message: 'Driver name is required' });
         }
 
+        const auditUser = resolveAuditUser(req);
+
         const query = `
             UPDATE drivers SET 
                 name = ?,
@@ -118,6 +141,7 @@ exports.updateDriver = async (req, res) => {
                 license_number = ?,
                 address = ?,
                 is_active = ?,
+                MB = ?,
                 updated_at = NOW()
             WHERE id = ?
         `;
@@ -128,6 +152,7 @@ exports.updateDriver = async (req, res) => {
             license_number || null,
             address || null,
             typeof is_active === 'number' ? is_active : (is_active ? 1 : 0),
+            auditUser,
             id
         ]);
 
@@ -142,7 +167,7 @@ exports.updateDriver = async (req, res) => {
     }
 };
 
-// Delete driver
+// Delete driver (soft delete)
 exports.deleteDriver = async (req, res) => {
     try {
         const { id } = req.body;
@@ -151,7 +176,11 @@ exports.deleteDriver = async (req, res) => {
             return res.status(400).json({ message: 'Driver ID is required' });
         }
 
-        const [result] = await db.execute('DELETE FROM drivers WHERE id = ?', [id]);
+        const auditUser = resolveAuditUser(req);
+        const [result] = await db.execute(
+            'UPDATE drivers SET is_active = 0, MB = ?, updated_at = NOW() WHERE id = ? AND is_active = 1',
+            [auditUser, id]
+        );
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Driver not found' });

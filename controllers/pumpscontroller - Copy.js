@@ -53,18 +53,8 @@ async function upsertMobileOilPurchaseRows(connection, { pumpId, stockItems, act
     console.warn('Could not fetch mobile oil rate from fuel_rates:', err.message);
   }
 
-  // Check if mobile_oil_purchase table exists first
-  let availableColumns = new Set();
-  try {
-    const [columnRows] = await connection.execute(`SHOW COLUMNS FROM mobile_oil_purchase`);
-    availableColumns = new Set((columnRows || []).map((c) => String(c.Field || '').toLowerCase()));
-  } catch (err) {
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      console.warn('mobile_oil_purchase table does not exist, skipping upsert');
-      return;
-    }
-    throw err;
-  }
+  const [columnRows] = await connection.execute(`SHOW COLUMNS FROM mobile_oil_purchase`);
+  const availableColumns = new Set((columnRows || []).map((c) => String(c.Field || '').toLowerCase()));
 
   // For updates, deactivate previous rows when table supports pump linkage.
   if (availableColumns.has('pump_id')) {
@@ -101,40 +91,36 @@ async function upsertMobileOilPurchaseRows(connection, { pumpId, stockItems, act
     maybeAdd('cb', actorName);
     maybeAdd('mb', actorName);
 
-    // Handle active, cd, md with proper value placement
     if (availableColumns.has('active')) {
       columns.push('active');
-      values.push(1);  // ← FIXED: Added value
-      placeholders.push('?');
+      placeholders.push('1');
     }
     if (availableColumns.has('cd')) {
       columns.push('cd');
-      values.push(new Date());  // ← FIXED: Added value
-      placeholders.push('?');
+      placeholders.push('NOW()');
     }
     if (availableColumns.has('md')) {
       columns.push('md');
-      values.push(new Date());  // ← FIXED: Added value
-      placeholders.push('?');
+      placeholders.push('NOW()');
     }
 
     if (columns.length === 0) {
       continue;
     }
 
-    // FIXED: Build SQL with proper parameterized query
-    const sql = `INSERT INTO mobile_oil_purchase (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`;
-    await connection.execute(sql, values);
+    await connection.execute(
+      `INSERT INTO mobile_oil_purchase (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`,
+      values
+    );
   }
 }
 
 exports.getTankTypes = async (req, res) => {
-  let connection;
   try {
-    connection = await db.getConnection();
     let rows = [];
-
+    let connection;
     try {
+      connection = await db.getConnection();
       const [resultRows] = await connection.execute(
         `SELECT id, total_capacity_liters, max_dip_mm
          FROM tank_types
@@ -143,17 +129,18 @@ exports.getTankTypes = async (req, res) => {
       );
       rows = resultRows || [];
     } catch (queryErr) {
-      // If the query fails (e.g., missing columns), try fallback query
       if (queryErr.code !== 'ER_BAD_FIELD_ERROR') {
         throw queryErr;
       }
 
-      const [fallbackRows] = await connection.execute(  // ← FIXED: Use connection, not getConnection()
+      const [fallbackRows] = await getConnection().execute(
         `SELECT id, fuel_type, total_capacity_liters, max_dip_mm
          FROM tank_types
          ORDER BY total_capacity_liters`
       );
       rows = fallbackRows || [];
+    } finally {
+      if (connection) connection.release();
     }
 
     res.json(rows.map((row) => ({
@@ -169,7 +156,7 @@ exports.getTankTypes = async (req, res) => {
     }
     res.status(500).json({ message: 'Server Error', error: err.message });
   } finally {
-    if (connection) connection.release();  // ← FIXED: connection is now in scope here
+    if (connection) connection.release();
   }
 };
 
@@ -215,9 +202,8 @@ exports.getMobileOilStockItems = async (req, res) => {
   try {
     connection = await db.getConnection();
     const { pump_id } = req.query;
-
     if (!pump_id) {
-      return res.status(400).json({ message: 'pump_id is required' });
+      return res.json([]);
     }
 
     // Get active mobile oil purchase records for the pump
@@ -261,8 +247,7 @@ exports.getMobileOilStockItems = async (req, res) => {
     res.json(stockItems);
   } catch (err) {
     console.error('Error fetching mobile oil stock items:', err);
-    // Handle table or column errors gracefully
-    if (err.code === 'ER_NO_SUCH_TABLE' || err.code === 'ER_BAD_FIELD_ERROR') {
+    if (err.code === 'ER_NO_SUCH_TABLE') {
       return res.json([]);
     }
     res.status(500).json({ message: 'Server Error', error: err.message });
@@ -347,6 +332,7 @@ exports.saveAdjustmentValues = async (req, res) => {
     connection = await db.getConnection();
     const { pump_id, adjustments } = req.body;
 
+
     if (!pump_id || !Array.isArray(adjustments) || adjustments.length === 0) {
       return res.status(400).json({ message: 'pump_id and adjustments array are required' });
     }
@@ -354,97 +340,80 @@ exports.saveAdjustmentValues = async (req, res) => {
     // Get the current user (adjuster) – adjust based on your auth system
     const currentUser = req.user?.username || req.user?.id || 'system';
 
-    await connection.beginTransaction();
 
-    let updatedCount = 0;
-    for (const adj of adjustments) {
-      const { tank_id, adjustment_value, variance, cb, mb } = adj;
-      const createdBy = cb || currentUser;  // FIXED: Use currentUser instead of 'system'
-      const modifiedBy = mb || createdBy;
 
-      if (!tank_id || adjustment_value === null || adjustment_value === undefined) {
-        continue;
-      }
+    try {
+      await connection.beginTransaction();
 
-      const adjustmentNum = Number(adjustment_value);
-      const varianceNum = variance === null || variance === undefined ? adjustmentNum : Number(variance);
+      let updatedCount = 0;
+      for (const adj of adjustments) {
+        const { tank_id, adjustment_value, variance, cb, mb } = adj;
+        const createdBy = cb || 'system';
+        const modifiedBy = mb || createdBy;
+        if (!tank_id || adjustment_value === null || adjustment_value === undefined) {
+          continue;
+        }
 
-      // 1. Update tank's current level
-      await connection.execute(
-        `UPDATE fuel_tanks
-           SET current_level = COALESCE(current_level, 0) + ?, MB = ?, MD = NOW()
-           WHERE id = ?`,
-        [adjustmentNum, modifiedBy, tank_id]  // FIXED: Added modifiedBy instead of NOW()
-      );
+        const adjustmentNum = Number(adjustment_value);
+        const varianceNum = variance === null || variance === undefined ? adjustmentNum : Number(variance);
 
-      // 2. Insert into fuel_tank_adjustments
-      // FIXED: Removed extra parameter - only 4 placeholders needed
-      await connection.execute(
-        `INSERT INTO fuel_tank_adjustments
-           (tank_id, adjustment_value, CB, MB, CD, MD, Active, Entry_Date)
-         VALUES (?, ?, ?, ?, NOW(), NOW(), 1, CURDATE())`,
-        [tank_id, adjustmentNum, createdBy, modifiedBy]
-      );
-
-      // 3. Find the most recent physical dip reading for this tank
-      const [latestDipRows] = await connection.execute(  // FIXED: Removed double brackets
-        `SELECT id FROM physical_dip_readings 
-         WHERE tank_id = ? AND Active = 1 
-         ORDER BY reading_time DESC, id DESC LIMIT 1`,
-        [tank_id]
-      );
-      const latestDip = latestDipRows && latestDipRows.length > 0 ? latestDipRows[0] : null;
-
-      if (latestDip) {
-        // 4. Update adjustment_value on that dip reading
+        // 1. Update tank's current level
         await connection.execute(
-          `UPDATE physical_dip_readings 
-           SET adjustment_value = ?, MB = ?, MD = NOW()
-           WHERE id = ?`,
-          [adjustmentNum, modifiedBy, latestDip.id]  // FIXED: Added modifiedBy
+          `UPDATE fuel_tanks
+             SET current_level = COALESCE(current_level, 0) + ?, MB = NOW(), MD = NOW()
+             WHERE id = ?`,
+          [adjustmentNum, tank_id]
         );
+
+        // 2. Insert into fuel_tank_adjustments
+        await connection.execute(
+          `INSERT INTO fuel_tank_adjustments
+             (tank_id, adjustment_value, CB, MB, CD, MD, Active, Entry_Date)
+           VALUES (?, ?, ?, ?, NOW(), NOW(), 1, CURDATE())`,
+          [tank_id, adjustmentNum, createdBy, modifiedBy]   // MB same as CB, or set NULL
+        );
+
+        // 3. Find the most recent physical dip reading for this tank
+        const [[latestDip]] = await connection.execute(
+          `SELECT id FROM physical_dip_readings 
+           WHERE tank_id = ? AND Active = 1 
+           ORDER BY reading_time DESC, id DESC LIMIT 1`,
+          [tank_id]
+        );
+
+        if (latestDip) {
+          // 4. Update adjustment_value on that dip reading
+          await connection.execute(
+            `UPDATE physical_dip_readings 
+             SET adjustment_value = ?, MB = NOW(), MD = NOW()
+             WHERE id = ?`,
+            [adjustmentNum, latestDip.id]
+          );
+        }
+
+        updatedCount++;
       }
 
-      updatedCount++;
+      await connection.commit();
+
+      res.json({
+        success: true,
+        message: `${updatedCount} adjustment(s) saved successfully`,
+        updated_count: updatedCount
+      });
+    } finally {
+      if (connection) connection.release();
     }
-
-    await connection.commit();
-
-    res.json({
-      success: true,
-      message: `${updatedCount} adjustment(s) saved successfully`,
-      updated_count: updatedCount
-    });
   } catch (err) {
-    if (connection) {
-      try {
-        await connection.rollback();
-      } catch (rollbackErr) {
-        console.error('Error rolling back transaction:', rollbackErr);
-      }
-    }
     console.error('Error saving adjustment values:', err);
-
-    // FIXED: Better error handling for specific cases
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.status(500).json({
-        message: 'Required tables do not exist. Please verify database schema.'
-      });
-    }
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.status(500).json({
-        message: 'Database schema mismatch. Please verify table structures.'
-      });
-    }
     res.status(500).json({ message: 'Server Error', error: err.message });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
 exports.getPumps = async (req, res) => {
   let connection;
   try {
+
     connection = await db.getConnection();
     const query = `
       SELECT 
@@ -483,11 +452,9 @@ exports.getPumps = async (req, res) => {
     const [rows] = await connection.execute(query);
     const pumpIds = (rows || []).map((r) => r.id).filter(Boolean);
     let inventoryByPump = {};
-
     if (pumpIds.length > 0) {
       const placeholders = pumpIds.map(() => '?').join(',');
-      // FIXED: Changed from db.execute to connection.execute
-      const [tankRows] = await connection.execute(
+      const [tankRows] = await db.execute(
         `SELECT pump_id, fuel_type,
           SUM(current_level) AS current_level,
           SUM(capacity) AS capacity
@@ -505,7 +472,6 @@ exports.getPumps = async (req, res) => {
         });
       });
     }
-
     const result = (rows || []).map((p) => ({
       ...p,
       inventory: inventoryByPump[p.id] || []
@@ -514,11 +480,6 @@ exports.getPumps = async (req, res) => {
   } catch (err) {
     console.error('Error fetching pumps:', err);
     if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.json([]);
-    }
-    // FIXED: Added specific handling for missing columns
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      console.warn('Some columns may not exist in the database schema');
       return res.json([]);
     }
     res.status(500).json({ message: 'Server Error', error: err.message });
@@ -536,40 +497,35 @@ exports.getPumpDetails = async (req, res) => {
       return res.status(400).json({ message: 'Pump ID is required' });
     }
 
-    // FIXED: Don't use double brackets for destructuring - execute returns [rows, fields]
-    const [pumpRows] = await connection.execute(
-      `SELECT 
-         pp.*,
-         m.name AS manager_name,
-         m.email AS manager_email
-       FROM petrol_pumps pp
-       LEFT JOIN users m ON pp.manager_id = m.id
-       WHERE pp.id = ?`,
-      [id]
-    );
-
-    const [tankRows] = await connection.execute(
-      `SELECT 
-         ft.*, 
-         tt.total_capacity_liters
-       FROM fuel_tanks ft
-       LEFT JOIN tank_types tt ON ft.tank_type_id = tt.id
-       WHERE ft.pump_id = ? AND ft.Active = 1
-       ORDER BY ft.fuel_type, ft.tank_number`,
-      [id]
-    );
-
-    const [machineRows] = await connection.execute(
-      `SELECT * 
-       FROM machines 
-       WHERE pump_id = ? AND Active = 1
-       ORDER BY machine_number`,
-      [id]
-    );
-
-    let nozzleRows = [];
-    try {
-      const [rows] = await connection.execute(
+    const [[pumpRows], [tankRows], [machineRows], [nozzleRows], [staffRows]] = await Promise.all([
+      connection.execute(
+        `SELECT 
+           pp.*,
+           m.name AS manager_name,
+           m.email AS manager_email
+         FROM petrol_pumps pp
+         LEFT JOIN users m ON pp.manager_id = m.id
+         WHERE pp.id = ?`,
+        [id]
+      ),
+      connection.execute(
+        `SELECT 
+           ft.*, 
+           tt.total_capacity_liters
+         FROM fuel_tanks ft
+         LEFT JOIN tank_types tt ON ft.tank_type_id = tt.id
+         WHERE pump_id = ? 
+         ORDER BY fuel_type, tank_number`,
+        [id]
+      ),
+      connection.execute(
+        `SELECT * 
+         FROM machines 
+         WHERE pump_id = ? 
+         ORDER BY machine_number`,
+        [id]
+      ),
+      connection.execute(
         `SELECT nz.*,
                 ft.tank_number,
                 ft.fuel_type,
@@ -591,51 +547,18 @@ exports.getPumpDetails = async (req, res) => {
            ) latest ON latest.nozzle_id = nr1.nozzle_id AND latest.max_id = nr1.id
            WHERE nr1.Active = 1
          ) nr_latest ON nr_latest.nozzle_id = nz.id
-         WHERE mc.pump_id = ? AND nz.Active = 1
+         WHERE mc.pump_id = ?
          ORDER BY mc.machine_number, nz.nozzle_number`,
         [id]
-      );
-      nozzleRows = rows || [];
-    } catch (nozzleErr) {
-      // If nozzle_readings table doesn't exist, query without the subquery
-      if (nozzleErr.code === 'ER_NO_SUCH_TABLE' || nozzleErr.code === 'ER_BAD_FIELD_ERROR') {
-        console.warn('Nozzle readings table or fields missing, fetching basic nozzle data');
-        const [basicNozzleRows] = await connection.execute(
-          `SELECT nz.*,
-                  ft.tank_number,
-                  ft.fuel_type
-           FROM nozzles nz
-           JOIN machines mc ON nz.machine_id = mc.id
-           LEFT JOIN fuel_tanks ft ON nz.tank_id = ft.id
-           WHERE mc.pump_id = ? AND nz.Active = 1
-           ORDER BY mc.machine_number, nz.nozzle_number`,
-          [id]
-        );
-        nozzleRows = basicNozzleRows || [];
-      } else {
-        throw nozzleErr;
-      }
-    }
-
-    let staffRows = [];
-    try {
-      const [rows] = await connection.execute(
+      ),
+      connection.execute(
         `SELECT ps.staffid, s.name, s.phone, s.designation, s.role
          FROM pump_staff ps
          JOIN staff s ON s.id = ps.staffid
          WHERE ps.pumpid = ? AND ps.Active = 1`,
         [id]
-      );
-      staffRows = rows || [];
-    } catch (staffErr) {
-      // Handle case where pump_staff or staff table doesn't exist
-      if (staffErr.code === 'ER_NO_SUCH_TABLE' || staffErr.code === 'ER_BAD_FIELD_ERROR') {
-        console.warn('Staff tables missing or schema mismatch');
-        staffRows = [];
-      } else {
-        throw staffErr;
-      }
-    }
+      ).catch(() => [[]])
+    ]);
 
     if (!pumpRows || pumpRows.length === 0) {
       return res.status(404).json({ message: 'Pump not found' });
@@ -652,12 +575,6 @@ exports.getPumpDetails = async (req, res) => {
     res.json({ pump, tanks, machines, staff });
   } catch (err) {
     console.error('Error fetching pump details:', err);
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.status(500).json({ message: 'Required tables do not exist. Please verify database schema.' });
-    }
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.status(500).json({ message: 'Database schema mismatch. Please verify table structures.' });
-    }
     res.status(500).json({ message: 'Server Error', error: err.message });
   } finally {
     if (connection) connection.release();
@@ -952,8 +869,9 @@ exports.updatePump = async (req, res) => {
       } else {
         throw colErr;
       }
+    } finally {
+      if (conn) conn.release();
     }
-    // FIXED: Removed premature connection release from here
 
     // If tanks/machines are provided, update them (full replacement)
     if (tanks.length > 0 || machines.length > 0) {
@@ -1135,6 +1053,7 @@ exports.updatePump = async (req, res) => {
           processedMachineIds.add(existingMachineId);
         } else {
           // Before inserting, check for conflicting machines (including inactive ones)
+          // The unique constraint applies to all rows regardless of Active status
           const [conflictingMachines] = await conn.execute(
             `SELECT id FROM machines 
              WHERE pump_id = ? AND machine_number = ?
@@ -1371,8 +1290,9 @@ exports.updatePump = async (req, res) => {
               } else {
                 throw insertErr;
               }
+            } finally {
+              if (conn) conn.release();
             }
-            // FIXED: Removed premature connection release from here
           }
         }
 
@@ -1487,9 +1407,6 @@ exports.updatePump = async (req, res) => {
     if (err.code === 'ER_DUP_ENTRY') {
       return res.status(400).json({ message: 'Duplicate tank, machine, or nozzle configuration detected' });
     }
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.status(500).json({ message: 'Database schema mismatch. Please verify table structures.' });
-    }
     res.status(500).json({ message: 'Server Error', error: err.message });
   } finally {
     if (conn) conn.release();
@@ -1497,7 +1414,6 @@ exports.updatePump = async (req, res) => {
 };
 
 exports.deletePump = async (req, res) => {
-  let connection;
   try {
     const id = Number(req.body?.id);
     const role = req.body?.role;
@@ -1511,96 +1427,64 @@ exports.deletePump = async (req, res) => {
       return res.status(403).json({ message: 'Only admin can delete petrol pumps' });
     }
 
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-
-    // 1. Soft delete nozzles first (child records)
-    await connection.execute(
-      `UPDATE nozzles n
-       JOIN machines m ON n.machine_id = m.id
-       SET n.Active = 0, n.MB = ?, n.MD = NOW()
-       WHERE m.pump_id = ? AND n.Active = 1`,
-      [MB, id]
-    );
-
-    // 2. Soft delete machines
-    const [machinesResult] = await connection.execute(
-      `UPDATE machines
+    const [result] = await db.execute(
+      `UPDATE petrol_pumps
        SET Active = 0, MB = ?, MD = NOW()
-       WHERE pump_id = ? AND Active = 1`,
+       WHERE id = ? AND Active = 1`,
       [MB, id]
     );
-
-    // 3. Soft delete tanks
-    const [tankResult] = await connection.execute(
+    const [tankresult] = await db.execute(
       `UPDATE fuel_tanks
        SET Active = 0, MB = ?, MD = NOW()
        WHERE pump_id = ? AND Active = 1`,
       [MB, id]
     );
 
-    // 4. Soft delete pump staff assignments
-    try {
-      await connection.execute(
-        `UPDATE pump_staff
-         SET Active = 0, MB = ?, MD = NOW()
-         WHERE pumpid = ? AND Active = 1`,
-        [MB, id]
-      );
-    } catch (staffErr) {
-      // If pump_staff table doesn't exist, ignore
-      if (staffErr.code !== 'ER_NO_SUCH_TABLE') {
-        throw staffErr;
-      }
-    }
-
-    // 5. Soft delete the pump itself
-    const [result] = await connection.execute(
-      `UPDATE petrol_pumps
+    // Get machine ids for the given pump_id
+    /*  const [machines] = await db.execute(
+       `SELECT id FROM machines WHERE pump_id = ? AND Active = 1`,
+       [id]
+     );
+     const machineIds = machines.map(row => row.id);
+ 
+     if (machineIds.length) {
+       // Update nozzles for those machine ids
+       await db.execute(
+         `UPDATE nozzles SET Active = 0, MB = ?, MD = NOW() WHERE machine_id IN (?) AND Active = 1`,
+         [MB, machineIds]
+       );
+     } */
+    await db.execute(
+      `UPDATE nozzles n
+   JOIN machines m ON n.machine_id = m.id
+   SET n.Active = 0, n.MB = ?, n.MD = NOW()
+   WHERE m.pump_id = ? AND n.Active = 1 AND m.Active = 1`,
+      [MB, id]
+    );
+    const [machinesresult] = await db.execute(
+      `UPDATE machines
        SET Active = 0, MB = ?, MD = NOW()
-       WHERE id = ? AND Active = 1`,
+       WHERE pump_id = ? AND Active = 1`,
       [MB, id]
     );
 
+
+
     if (!result || result.affectedRows === 0) {
-      await connection.rollback();
       return res.status(404).json({ message: 'Pump not found or already inactive' });
     }
 
-    await connection.commit();
-
-    return res.status(200).json({
-      message: 'Pump deleted successfully',
-      affected_rows: {
-        pump: result.affectedRows || 0,
-        machines: machinesResult.affectedRows || 0,
-        tanks: tankResult.affectedRows || 0
-      }
-    });
+    return res.status(200).json({ message: 'Pump deleted successfully' });
   } catch (err) {
-    if (connection) {
-      try {
-        await connection.rollback();
-      } catch (rollbackErr) {
-        console.error('Error rolling back transaction:', rollbackErr);
-      }
-    }
     console.error('Error deleting pump:', err);
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.status(500).json({ message: 'Required tables do not exist. Please verify database schema.' });
-    }
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.status(500).json({ message: 'Database schema mismatch. Please verify table structures.' });
-    }
     return res.status(500).json({ message: 'Server Error', error: err.message });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
 // Get tank inventory with low level alerts.
 // Mobile Oil current level is sourced from the latest daily_tank_inventory row when available.
 exports.getTankInventory = async (req, res) => {
+
   let connection;
   try {
     connection = await db.getConnection();
@@ -1720,7 +1604,6 @@ exports.getTankInventory = async (req, res) => {
     // For mobile oil, prefer latest daily_tank_inventory dip snapshot over static fuel_tanks.current_level.
     const mobileTankLevelById = {};
     try {
-      // FIXED: Removed trailing comma after dti.id
       const mobileSnapshotQuery = `
         SELECT
           dti.tank_id,
@@ -1728,7 +1611,7 @@ exports.getTankInventory = async (req, res) => {
           dti.opening_level,
           dse.entry_date,
           dti.id,
-          dti.received_quantity
+         dti.received_quantity,
         FROM daily_tank_inventory dti
         INNER JOIN daily_sales_entries dse ON dse.id = dti.daily_entry_id
         INNER JOIN fuel_tanks ft ON ft.id = dti.tank_id
@@ -1760,8 +1643,9 @@ exports.getTankInventory = async (req, res) => {
       ) {
         throw snapshotErr;
       }
+    } finally {
+      if (connection) connection.release();
     }
-    // FIXED: Removed premature connection release from here
 
     const tanks = (rows || []).map(row => {
       const fuelType = String(row.fuel_type || '');
@@ -1810,12 +1694,7 @@ exports.getTankInventory = async (req, res) => {
     if (err.code === 'ER_NO_SUCH_TABLE') {
       return res.json({ tanks: [], total_tanks: 0, low_level_count: 0, has_alerts: false });
     }
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.json({ tanks: [], total_tanks: 0, low_level_count: 0, has_alerts: false });
-    }
     res.status(500).json({ message: 'Server Error', error: err.message });
-  } finally {
-    if (connection) connection.release();
   }
 };
 
@@ -1834,43 +1713,6 @@ exports.getDipVolumeByType = async (req, res) => {
       return res.status(400).json({ message: 'valid dip_mm is required' });
     }
 
-    // Check if dip_chart table exists
-    let dipChartExists = true;
-    try {
-      const [tables] = await connection.execute(
-        `SELECT 1 FROM information_schema.tables 
-         WHERE table_schema = DATABASE() AND table_name = 'dip_chart'`
-      );
-      dipChartExists = tables && tables.length > 0;
-    } catch (tableErr) {
-      dipChartExists = false;
-    }
-
-    if (!dipChartExists) {
-      // Fall back to linear estimate from tank_types
-      const [typeRows] = await connection.execute(
-        `SELECT total_capacity_liters, max_dip_mm FROM tank_types WHERE id = ? LIMIT 1`,
-        [tankTypeId]
-      );
-      if (!typeRows || typeRows.length === 0) {
-        return res.status(404).json({ message: 'No dip chart data found for this tank type' });
-      }
-      const maxDip = parseFloat(typeRows[0].max_dip_mm) || 0;
-      const maxCapacity = parseFloat(typeRows[0].total_capacity_liters) || 0;
-      if (maxDip <= 0 || maxCapacity <= 0) {
-        return res.status(404).json({ message: 'Invalid tank type configuration' });
-      }
-      const clampedDip = Math.min(dipMm, maxDip);
-      const estimated = Math.round(((clampedDip / maxDip) * maxCapacity) * 100) / 100;
-      return res.json({
-        tank_type_id: tankTypeId,
-        dip_mm: dipMm,
-        volume_liters: estimated,
-        source: 'estimated'
-      });
-    }
-
-    // Try to find exact match
     const [exactRows] = await connection.execute(
       `SELECT volume_liters
        FROM dip_chart
@@ -1888,7 +1730,6 @@ exports.getDipVolumeByType = async (req, res) => {
       });
     }
 
-    // Find lower and upper bounds
     const [lowerRows] = await connection.execute(
       `SELECT dip_mm, volume_liters
        FROM dip_chart
@@ -1968,42 +1809,30 @@ exports.getDipVolumeByType = async (req, res) => {
     });
   } catch (err) {
     console.error('Error fetching dip chart volume:', err);
-
-    // FIXED: Check if connection exists before using it
     if (err.code === 'ER_NO_SUCH_TABLE') {
+      // dip_chart doesn't exist — fall back to linear estimate from tank_types
       try {
-        // Only try fallback if we have a connection and tankTypeId is valid
-        if (connection && tankTypeId) {
-          const [typeRows] = await connection.execute(
-            `SELECT total_capacity_liters, max_dip_mm FROM tank_types WHERE id = ? LIMIT 1`,
-            [tankTypeId]
-          );
-          if (typeRows && typeRows.length > 0) {
-            const maxDip = parseFloat(typeRows[0].max_dip_mm) || 0;
-            const maxCapacity = parseFloat(typeRows[0].total_capacity_liters) || 0;
-            if (maxDip > 0 && maxCapacity > 0) {
-              const clampedDip = Math.min(dipMm, maxDip);
-              const estimated = Math.round(((clampedDip / maxDip) * maxCapacity) * 100) / 100;
-              return res.json({
-                tank_type_id: tankTypeId,
-                dip_mm: dipMm,
-                volume_liters: estimated,
-                source: 'estimated'
-              });
-            }
+        const [typeRows] = await connection.execute(
+          `SELECT total_capacity_liters, max_dip_mm FROM tank_types WHERE id = ? LIMIT 1`,
+          [tankTypeId]
+        );
+        if (typeRows && typeRows.length > 0) {
+          const maxDip = parseFloat(typeRows[0].max_dip_mm) || 0;
+          const maxCapacity = parseFloat(typeRows[0].total_capacity_liters) || 0;
+          if (maxDip > 0 && maxCapacity > 0) {
+            const clampedDip = Math.min(dipMm, maxDip);
+            const estimated = Math.round(((clampedDip / maxDip) * maxCapacity) * 100) / 100;
+            return res.json({
+              tank_type_id: tankTypeId,
+              dip_mm: dipMm,
+              volume_liters: estimated,
+              source: 'estimated'
+            });
           }
         }
-      } catch (_) {
-        // Ignore fallback error
-        console.warn('Fallback estimation failed:', _.message);
-      }
+      } catch (_) { /* ignore fallback error */ }
       return res.status(500).json({ message: 'dip_chart table not found' });
     }
-
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.status(500).json({ message: 'Database schema mismatch. Please verify dip_chart table structure.' });
-    }
-
     res.status(500).json({ message: 'Server Error', error: err.message });
   } finally {
     if (connection) connection.release();
@@ -2017,18 +1846,17 @@ exports.getDipVolumeByType = async (req, res) => {
  * Returns: { hasDipReadings: boolean, daily_entry_id: number | null }
  */
 exports.checkTodayDipReadings = async (req, res) => {
+
   let connection;
   try {
     connection = await db.getConnection();
     const pumpId = req.query.pump_id;
     const entryDate = req.query.entry_date;
-
     if (!pumpId || !entryDate) {
       return res.status(400).json({ message: 'pump_id and entry_date are required' });
     }
 
-    // FIXED: Removed double brackets - execute returns [rows, fields]
-    const [entryRows] = await connection.execute(
+    const [[entryRow]] = await connection.execute(
       `SELECT id
        FROM daily_sales_entries
        WHERE pump_id = ?
@@ -2039,10 +1867,9 @@ exports.checkTodayDipReadings = async (req, res) => {
       [pumpId, entryDate]
     );
 
-    const dailyEntryId = entryRows && entryRows.length > 0 ? entryRows[0].id : null;
+    const dailyEntryId = entryRow?.id || null;
 
-    // FIXED: Removed double brackets - execute returns [rows, fields]
-    const [dipRows] = await connection.execute(
+    const [[dipStats]] = await connection.execute(
       `SELECT COUNT(*) AS dip_count
        FROM physical_dip_readings pdr
        INNER JOIN fuel_tanks ft ON ft.id = pdr.tank_id AND ft.Active = 1
@@ -2052,8 +1879,7 @@ exports.checkTodayDipReadings = async (req, res) => {
       [pumpId, entryDate]
     );
 
-    const dipCount = dipRows && dipRows.length > 0 ? Number(dipRows[0].dip_count || 0) : 0;
-    const openingSaved = dipCount > 0;
+    const openingSaved = Number(dipStats?.dip_count || 0) > 0;
     const closingSaved = false;
 
     return res.json({
@@ -2065,13 +1891,6 @@ exports.checkTodayDipReadings = async (req, res) => {
     });
   } catch (err) {
     console.error('Error checking dip readings:', err);
-    // FIXED: Added specific error handling
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.status(500).json({ message: 'Required tables do not exist. Please verify database schema.' });
-    }
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.status(500).json({ message: 'Database schema mismatch. Please verify table structures.' });
-    }
     res.status(500).json({ message: 'Server Error', error: err.message });
   } finally {
     if (connection) connection.release();
@@ -2120,13 +1939,10 @@ exports.saveDipReadings = async (req, res) => {
       [pumpId, entryDate, cb, mb]
     );
 
-    // FIXED: Removed double brackets - execute returns [rows, fields]
-    const [entryRows] = await connection.execute(
+    const [[entryRow]] = await connection.execute(
       `SELECT id FROM daily_sales_entries WHERE pump_id = ? AND entry_date = ? LIMIT 1`,
       [pumpId, entryDate]
     );
-
-    const entryRow = entryRows && entryRows.length > 0 ? entryRows[0] : null;
     if (!entryRow || !entryRow.id) {
       throw new Error('Failed to create or find daily_sales_entries record');
     }
@@ -2136,10 +1952,8 @@ exports.saveDipReadings = async (req, res) => {
     let primaryKeyFixed = false;
     let updatedExistingCount = 0;
     let insertedCount = 0;
-
     for (const r of readings) {
-      // FIXED: Removed double brackets - execute returns [rows, fields]
-      const [existingDipRows] = await connection.execute(
+      const [[existingDipRow]] = await connection.execute(
         `SELECT id
          FROM physical_dip_readings
          WHERE tank_id = ?
@@ -2150,10 +1964,7 @@ exports.saveDipReadings = async (req, res) => {
         [r.tank_id, entryDate]
       );
 
-      const existingDipRow = existingDipRows && existingDipRows.length > 0 ? existingDipRows[0] : null;
-
       const readingTime = `${entryDate} ${new Date().toTimeString().slice(0, 8)}`;
-
       if (existingDipRow && existingDipRow.id) {
         await connection.execute(
           `UPDATE physical_dip_readings
@@ -2187,7 +1998,6 @@ exports.saveDipReadings = async (req, res) => {
               mb
             ]
           );
-          insertedCount += 1;
         } catch (insertErr) {
           const isPrimaryZeroDuplicate = insertErr &&
             insertErr.code === 'ER_DUP_ENTRY' &&
@@ -2219,12 +2029,14 @@ exports.saveDipReadings = async (req, res) => {
               mb
             ]
           );
-          insertedCount += 1;
         }
+        insertedCount += 1;
       }
+
     }
 
     await connection.commit();
+    connection.release();
 
     return res.json({
       success: true,
@@ -2237,32 +2049,11 @@ exports.saveDipReadings = async (req, res) => {
     });
   } catch (err) {
     if (connection) {
-      try {
-        await connection.rollback();
-      } catch (rollbackErr) {
-        console.error('Error rolling back transaction:', rollbackErr);
-      }
+      try { await connection.rollback(); } catch (_) { }
+      connection.release();
     }
     console.error('Error saving dip readings:', err);
-
-    // FIXED: Added specific error handling
-    if (err.code === 'ER_NO_SUCH_TABLE') {
-      return res.status(500).json({ message: 'Required tables do not exist. Please verify database schema.' });
-    }
-    if (err.code === 'ER_BAD_FIELD_ERROR') {
-      return res.status(500).json({ message: 'Database schema mismatch. Please verify table structures.' });
-    }
-    if (err.code === 'ER_DUP_ENTRY') {
-      return res.status(400).json({ message: 'Duplicate entry detected. Please check your data.' });
-    }
     res.status(500).json({ message: 'Server Error', error: err.message });
-  } finally {
-    if (connection) {
-      try {
-        connection.release();
-      } catch (releaseErr) {
-        console.error('Error releasing connection:', releaseErr);
-      }
-    }
   }
 };
+

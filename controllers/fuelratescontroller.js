@@ -1,5 +1,19 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return (
+        b.MB ||
+        b.CB ||
+        b.userName ||
+        b.username ||
+        b.UserName ||
+        b.createdBy ||
+        b.modifiedBy ||
+        'System'
+    ).toString().trim() || 'System';
+}
+
 // Get all fuel rates
 exports.getFuelRates = async (req, res) => {
     try {
@@ -136,14 +150,14 @@ exports.addFuelRate = async (req, res) => {
             return res.status(400).json({ message: 'Effective date is required' });
         }
 
-        const CB = req.body.CB || 'System';
+        const auditUser = resolveAuditUser(req);
 
         const query = `
-            INSERT INTO fuel_rates (fuel_type_id, rate, effective_date, active, CB, CD, MD) 
-            VALUES (?, ?, ?, 1, ?, NOW(), NOW())
+            INSERT INTO fuel_rates (fuel_type_id, rate, effective_date, active, CB, MB, CD, MD) 
+            VALUES (?, ?, ?, 1, ?, ?, NOW(), NOW())
         `;
 
-        const [result] = await db.execute(query, [fuel_type_id, rate, effective_date, CB]);
+        const [result] = await db.execute(query, [fuel_type_id, rate, effective_date, auditUser, auditUser]);
 
         res.json({
             message: 'Fuel rate added successfully',
@@ -178,7 +192,7 @@ exports.updateFuelRate = async (req, res) => {
         }
 
         const activeValue = Active !== undefined ? Active : (active !== undefined ? active : 1);
-        const MB = req.body.MB || 'System';
+        const MB = resolveAuditUser(req);
 
         const query = `
             UPDATE fuel_rates SET 
@@ -220,8 +234,9 @@ exports.deleteFuelRate = async (req, res) => {
             return res.status(400).json({ message: 'Fuel Rate ID is required' });
         }
 
-        const query = 'UPDATE fuel_rates SET Active = 0, MD = NOW() WHERE id = ?';
-        const [result] = await db.execute(query, [id]);
+        const MB = resolveAuditUser(req);
+        const query = 'UPDATE fuel_rates SET Active = 0, MB = ?, MD = NOW() WHERE id = ?';
+        const [result] = await db.execute(query, [MB, id]);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Fuel Rate not found' });

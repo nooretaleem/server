@@ -1,5 +1,19 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const body = req.body || {};
+    return (
+        body.MB ||
+        body.CB ||
+        body.userName ||
+        body.username ||
+        body.UserName ||
+        body.createdBy ||
+        body.modifiedBy ||
+        'System'
+    ).toString().trim() || 'System';
+}
+
 // Get all banks (only active ones)
 exports.getBanks = async (req, res) => {
     try {
@@ -26,22 +40,22 @@ exports.getBanks = async (req, res) => {
         console.error('Error SQL state:', err.sqlState);
         console.error('Error message:', err.message);
         console.error('Full error:', JSON.stringify(err, null, 2));
-        
+
         if (err.code === 'ER_NO_SUCH_TABLE') {
             // Table doesn't exist - return empty array
             console.log('Bank table does not exist, returning empty array');
             res.json([]);
         } else if (err.code === 'ER_BAD_FIELD_ERROR') {
             // Column doesn't exist - might be case sensitivity or wrong column name
-            res.status(500).json({ 
-                message: 'Database schema error', 
+            res.status(500).json({
+                message: 'Database schema error',
                 error: 'One or more columns do not exist. Please check your database schema.',
                 details: err.message,
                 hint: 'Check if the bank table exists and has the correct column names (ID, Name, Branch, cd, md, active)'
             });
         } else {
-            res.status(500).json({ 
-                message: 'Server Error', 
+            res.status(500).json({
+                message: 'Server Error',
                 error: err.message,
                 code: err.code,
                 sqlState: err.sqlState,
@@ -71,11 +85,11 @@ exports.getBank = async (req, res) => {
             WHERE ID = ? AND active = 1
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Bank not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching bank:', err);
@@ -86,6 +100,7 @@ exports.getBank = async (req, res) => {
 // Add new bank
 exports.addBank = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const {
             Name,
             Branch
@@ -96,13 +111,15 @@ exports.addBank = async (req, res) => {
         }
 
         const query = `
-            INSERT INTO bank (Name, Branch, active) 
-            VALUES (?, ?, 1)
+            INSERT INTO bank (Name, Branch, CB, MB, active) 
+            VALUES (?, ?, ?, ?, 1)
         `;
 
         const [result] = await db.execute(query, [
             Name,
-            Branch || null
+            Branch || null,
+            auditUser,
+            auditUser
         ]);
 
         res.json({
@@ -122,6 +139,7 @@ exports.addBank = async (req, res) => {
 // Update bank
 exports.updateBank = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const {
             ID,
             Name,
@@ -139,6 +157,7 @@ exports.updateBank = async (req, res) => {
             UPDATE bank SET 
                 Name = ?,
                 Branch = ?,
+                MB = ?,
                 md = NOW()
             WHERE ID = ? AND active = 1
         `;
@@ -146,6 +165,7 @@ exports.updateBank = async (req, res) => {
         const [result] = await db.execute(query, [
             Name,
             Branch || null,
+            auditUser,
             ID
         ]);
 
@@ -164,6 +184,7 @@ exports.updateBank = async (req, res) => {
 exports.deleteBank = async (req, res) => {
     const connection = await db.getConnection();
     try {
+        const auditUser = resolveAuditUser(req);
         const { id } = req.body;
 
         if (!id) {
@@ -174,8 +195,8 @@ exports.deleteBank = async (req, res) => {
 
         // Soft delete: set active = 0 for the bank
         const [bankResult] = await connection.execute(
-            'UPDATE bank SET active = 0, md = NOW() WHERE ID = ?', 
-            [id]
+            'UPDATE bank SET active = 0, MB = ?, md = NOW() WHERE ID = ?',
+            [auditUser, id]
         );
 
         if (bankResult.affectedRows === 0) {
@@ -185,8 +206,8 @@ exports.deleteBank = async (req, res) => {
 
         // Set all associated accounts to active = 0
         await connection.execute(
-            'UPDATE accounts SET active = 0, MD = NOW() WHERE BankID = ? AND active = 1',
-            [id]
+            'UPDATE accounts SET active = 0, MB = ?, MD = NOW() WHERE BankID = ? AND active = 1',
+            [auditUser, id]
         );
 
         await connection.commit();

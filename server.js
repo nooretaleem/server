@@ -5,10 +5,41 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const dataRoutes = require('./routes/authentication');
 
+
 const app = express();
 
 // Middleware
-app.use(cors());
+const allowedOrigins = new Set([
+  'http://localhost:4200',
+  'http://localhost:5000',
+  'https://zeeshanpetrolium.vercel.app',
+  'https://www.zeeshanpetrolium.vercel.app',
+  'https://zeeshanpetroerp.vercel.app',
+  'https://www.zeeshanpetroerp.vercel.app',
+  'https://demopetrofrontend.vercel.app'
+]);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    const normalizedOrigin = origin.replace(/\/$/, '');
+    if (allowedOrigins.has(normalizedOrigin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'token'],
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 

@@ -1,5 +1,10 @@
 const db = require('../models/db');
 
+const resolveAuditUser = (req) => {
+    const payload = req.body || {};
+    return payload.MB || payload.CB || payload.userName || payload.username || payload.UserName || payload.createdBy || payload.modifiedBy || 'System';
+};
+
 // Get all meters
 exports.getMeters = async (req, res) => {
     try {
@@ -24,14 +29,14 @@ exports.getMeters = async (req, res) => {
             WHERE m.Active = 1
         `;
         const params = [];
-        
+
         if (stationId) {
             query += ' AND m.customer_id = ?';
             params.push(stationId);
         }
-        
+
         query += ' ORDER BY c.name, ft.name, m.meter_no';
-        
+
         const [rows] = await db.execute(query, params);
         res.json(rows);
     } catch (err) {
@@ -71,11 +76,11 @@ exports.getMeter = async (req, res) => {
             WHERE m.id = ? AND m.Active = 1
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Meter not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching meter:', err);
@@ -104,21 +109,21 @@ exports.addMeter = async (req, res) => {
             WHERE customer_id = ? AND fuel_type_id = ? AND meter_no = ? AND Active = 1
         `;
         const [existing] = await db.execute(checkQuery, [customer_id, fuel_type_id, meter_no]);
-        
+
         if (existing.length > 0) {
-            return res.status(400).json({ 
-                message: 'Meter with this number already exists for this station and fuel type' 
+            return res.status(400).json({
+                message: 'Meter with this number already exists for this station and fuel type'
             });
         }
 
-        const CB = req.body.CB || 'System';
+        const auditUser = resolveAuditUser(req);
 
         const query = `
-            INSERT INTO meters (customer_id, fuel_type_id, meter_no, active, CB, CD, MD) 
-            VALUES (?, ?, ?, 1, ?, NOW(), NOW())
+            INSERT INTO meters (customer_id, fuel_type_id, meter_no, active, CB, MB, CD, MD) 
+            VALUES (?, ?, ?, 1, ?, ?, NOW(), NOW())
         `;
 
-        const [result] = await db.execute(query, [customer_id, fuel_type_id, meter_no, CB]);
+        const [result] = await db.execute(query, [customer_id, fuel_type_id, meter_no, auditUser, auditUser]);
 
         res.json({
             message: 'Meter added successfully',
@@ -158,15 +163,15 @@ exports.updateMeter = async (req, res) => {
             WHERE customer_id = ? AND fuel_type_id = ? AND meter_no = ? AND id != ? AND Active = 1
         `;
         const [existing] = await db.execute(checkQuery, [customer_id, fuel_type_id, meter_no, id]);
-        
+
         if (existing.length > 0) {
-            return res.status(400).json({ 
-                message: 'Meter with this number already exists for this station and fuel type' 
+            return res.status(400).json({
+                message: 'Meter with this number already exists for this station and fuel type'
             });
         }
 
         const activeValue = Active !== undefined ? Active : (active !== undefined ? active : 1);
-        const MB = req.body.MB || 'System';
+        const MB = resolveAuditUser(req);
 
         const query = `
             UPDATE meters SET 
@@ -203,7 +208,7 @@ exports.updateMeter = async (req, res) => {
 exports.deleteMeter = async (req, res) => {
     try {
         const id = req.body.id || req.params.id;
-        
+
         if (!id) {
             return res.status(400).json({ message: 'Meter ID is required' });
         }
@@ -211,15 +216,16 @@ exports.deleteMeter = async (req, res) => {
         // Check if meter has associated readings
         const checkQuery = 'SELECT COUNT(*) as count FROM meter_readings WHERE meter_id = ? AND Active = 1';
         const [checkResult] = await db.execute(checkQuery, [id]);
-        
+
         if (checkResult[0].count > 0) {
-            return res.status(400).json({ 
-                message: 'Cannot delete meter. It has associated meter readings. Please delete or deactivate readings first.' 
+            return res.status(400).json({
+                message: 'Cannot delete meter. It has associated meter readings. Please delete or deactivate readings first.'
             });
         }
 
-        const query = 'UPDATE meters SET Active = 0, MD = NOW() WHERE id = ?';
-        const [result] = await db.execute(query, [id]);
+        const MB = resolveAuditUser(req);
+        const query = 'UPDATE meters SET Active = 0, MB = ?, MD = NOW() WHERE id = ?';
+        const [result] = await db.execute(query, [MB, id]);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Meter not found' });

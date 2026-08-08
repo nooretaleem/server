@@ -1,7 +1,12 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return b.MB || b.CB || b.userName || b.username || b.UserName || b.createdBy || b.modifiedBy || 'System';
+}
+
 // Get all companies (only active ones)
-exports.getCompanies = async (req, res) => {
+exports.getCompanies_old = async (req, res) => {
     try {
         const query = `
             SELECT 
@@ -27,6 +32,48 @@ exports.getCompanies = async (req, res) => {
     }
 };
 
+exports.getCompanies = async (req, res) => {
+    let connection;
+
+    try {
+        connection = await db.getConnection();
+
+        const [rows] = await connection.execute(`
+      SELECT 
+        id,
+        name,
+        CD,
+        CB,
+        MD,
+        active
+      FROM company
+      WHERE active = 1
+      ORDER BY name ASC
+    `);
+
+        return res.status(200).json(rows || []);
+
+    } catch (err) {
+        console.error('Error fetching companies:', err);
+
+        if (err.code === 'ER_NO_SUCH_TABLE') {
+            return res.status(200).json([]);
+        }
+
+        return res.status(500).json({
+            message: 'Server Error',
+            error: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
+    } finally {
+        if (connection) {
+            try {
+                connection.release();
+            } catch (releaseErr) {
+                console.error('Error releasing connection:', releaseErr.message);
+            }
+        }
+    }
+};
 // Get single company by ID
 exports.getCompany = async (req, res) => {
     try {
@@ -37,11 +84,11 @@ exports.getCompany = async (req, res) => {
 
         const query = 'SELECT * FROM company WHERE id = ? AND active = 1';
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Company not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching company:', err);
@@ -62,20 +109,20 @@ exports.addCompany = async (req, res) => {
             return res.status(400).json({ message: 'Company name is required' });
         }
 
-        // Get CB (Created By) from request body, default to 'System' if not provided
-        const CB = req.body.CB || 'System';
+        const auditUser = resolveAuditUser(req);
 
         await connection.beginTransaction();
 
-        // Insert into company table with CB, CD, MD, active (default active=1)
+        // Insert into company table with CB, MB, CD, MD, active (default active=1)
         const companyQuery = `
-            INSERT INTO company (name, CB, CD, MD, active) 
-            VALUES (?, ?, NOW(), NOW(), 1)
+            INSERT INTO company (name, CB, MB, CD, MD, active) 
+            VALUES (?, ?, ?, NOW(), NOW(), 1)
         `;
 
         const [companyResult] = await connection.execute(companyQuery, [
             name,
-            CB
+            auditUser,
+            auditUser
         ]);
 
         const companyId = companyResult.insertId;
@@ -121,15 +168,18 @@ exports.updateCompany = async (req, res) => {
 
         await connection.beginTransaction();
 
-        // Update company table (only name and MD, keep CD and CB as original)
+        const auditUser = resolveAuditUser(req);
+
+        // Update company table
         const companyQuery = `
             UPDATE company 
-            SET name = ?, MD = NOW()
+            SET name = ?, MB = ?, MD = NOW()
             WHERE id = ? AND active = 1
         `;
 
         const [result] = await connection.execute(companyQuery, [
             name,
+            auditUser,
             id
         ]);
 
@@ -192,8 +242,8 @@ exports.deleteCompany = async (req, res) => {
             if (depoCompanyRows[0].count > 0) {
                 await connection.rollback();
                 connection.release();
-                return res.status(400).json({ 
-                    message: `Cannot delete: This company is linked to ${depoCompanyRows[0].count} depo(s).` 
+                return res.status(400).json({
+                    message: `Cannot delete: This company is linked to ${depoCompanyRows[0].count} depo(s).`
                 });
             }
         } catch (err) {
@@ -201,9 +251,11 @@ exports.deleteCompany = async (req, res) => {
             console.log('Note: Could not check depo_company:', err.message);
         }
 
+        const auditUser = resolveAuditUser(req);
+
         // Soft delete: set active=0 and update MD
-        const query = 'UPDATE company SET active = 0, MD = NOW() WHERE id = ?';
-        const [result] = await connection.execute(query, [id]);
+        const query = 'UPDATE company SET active = 0, MB = ?, MD = NOW() WHERE id = ?';
+        const [result] = await connection.execute(query, [auditUser, id]);
 
         if (result.affectedRows === 0) {
             await connection.rollback();

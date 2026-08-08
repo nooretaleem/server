@@ -1,5 +1,9 @@
 const express = require('express');
 const router = express.Router();
+
+
+
+
 const dataController = require('../controllers/datacontroller');
 const projectController = require('../controllers/projectcontroller');
 const tripsController = require('../controllers/tripscontroller');
@@ -68,7 +72,12 @@ router.delete('/deleteRole', userController.deleteRole);
 router.post('/addRoleModules', userController.addRoleModules);
 
 // Dashboard
+router.get('/kpitrenddata', projectController.kpitrenddata);
 router.get('/getDashboardData', projectController.getDashboardData);
+router.get('/getPumpAdvancesTotal', projectController.getPumpAdvancesTotal);
+router.get('/getPumpAdvanceDetails', projectController.getPumpAdvanceDetails);
+router.get('/getPumpCashInHandDetails', projectController.getPumpCashInHandDetails);
+router.get('/getRemainingFuelInventory', projectController.getRemainingFuelInventory);
 router.get('/getPetrolPumpDashboard', petrolPumpDashboardController.getPetrolPumpDashboard);
 router.get('/getPumpDashboardData', petrolPumpDashboardController.getPumpDashboardData);
 router.get('/getPendingTrips', projectController.getPendingTrips);
@@ -91,6 +100,10 @@ router.get('/getTodayRecoveries', projectController.getTodayRecoveries);
 
 // Petrol Pumps
 router.get('/getPumps', pumpsController.getPumps);
+router.get('/getTankTypes', pumpsController.getTankTypes);
+router.get('/getMobileOilRate', pumpsController.getMobileOilRate);
+router.get('/getMobileOilStockItems', pumpsController.getMobileOilStockItems);
+router.post('/saveAdjustmentValues', pumpsController.saveAdjustmentValues);
 router.get('/getPumpDetails', pumpsController.getPumpDetails);
 router.get('/getTankInventory', pumpsController.getTankInventory);
 router.get('/getDipVolumeByType', pumpsController.getDipVolumeByType);
@@ -98,20 +111,34 @@ router.get('/checkTodayDipReadings', pumpsController.checkTodayDipReadings);
 router.post('/saveDipReadings', pumpsController.saveDipReadings);
 router.post('/createPump', pumpsController.createPump);
 router.post('/updatePump', pumpsController.updatePump);
+router.post('/deletePump', pumpsController.deletePump);
 
 // Daily Sales Entry (submit full daily entry)
 router.get('/getPreviousDayCash', dailySalesEntryController.getPreviousDayCash);
 router.get('/getLatestNozzleReadings', dailySalesEntryController.getLatestNozzleReadings);
 router.get('/checkTodayNozzleReadings', dailySalesEntryController.checkTodayNozzleReadings);
+router.get('/getPumpAssignedStaff', dailySalesEntryController.getPumpAssignedStaff);
 router.get('/getNozzleReadingsByDate', dailySalesEntryController.getNozzleReadingsByDate);
+router.get('/getPumpDailyEntryReport', dailySalesEntryController.getPumpDailyEntryReport);
+router.get('/getWithdrawalsByDate', dailySalesEntryController.getWithdrawalsByDate);
+
 router.post('/submitDailyEntry', dailySalesEntryController.submitDailyEntry);
 router.post('/updateNozzleReadings', dailySalesEntryController.updateNozzleReadings);
 router.post('/getExpensesByDate', dailySalesEntryController.getExpensesByDate);
 router.post('/updateExpenses', dailySalesEntryController.updateExpenses);
 router.get('/getExpenseCategories', dailySalesEntryController.getExpenseCategories);
 router.post('/saveExpenses', dailySalesEntryController.saveExpenses);
+router.post('/getStaffAdvancesByDate', dailySalesEntryController.getStaffAdvancesByDate);
+router.post('/saveStaffAdvances', dailySalesEntryController.saveStaffAdvances);
+router.post('/getPumpAdvancesByDate', dailySalesEntryController.getPumpAdvancesByDate);
+router.post('/savePumpAdvances', dailySalesEntryController.savePumpAdvances);
 router.post('/getCreditSalesByDate', dailySalesEntryController.getCreditSalesByDate);
 router.post('/saveCreditSales', dailySalesEntryController.saveCreditSales);
+router.post('/getOtherIncomeByDate', dailySalesEntryController.getOtherIncomeByDate);
+router.post('/updateCashManagementOtherIncome', dailySalesEntryController.updateCashManagementOtherIncome);
+router.post('/getBankTransfersByDate', dailySalesEntryController.getBankTransfersByDate);
+router.post('/saveBankTransfers', dailySalesEntryController.saveBankTransfers);
+router.post('/saveWithdrawals', dailySalesEntryController.saveWithdrawals);
 
 // Trips
 router.get('/getTrips', tripsController.getTrips);
@@ -137,6 +164,8 @@ router.get('/getFilteredPolSales', tripsController.getFilteredPolSales);
 router.get('/getTripProducts', tripsController.getTripProducts);
 router.get('/getTripProductDetails', tripsController.getTripProductDetails);
 router.post('/addSale', tripsController.addSale);
+router.get('/getFuelPurchasedForUnload', tripsController.getFuelPurchasedForUnload);
+router.post('/unloadFuelToTank', tripsController.unloadFuelToTank);
 
 // Vehicle Rent
 router.get('/getVehicleRents', vehicleRentController.getVehicleRents);
@@ -168,11 +197,23 @@ router.get('/getCustomerFuelByType', customersController.getCustomerFuelByType);
 router.post('/assignMeter', metersController.updateMeter);
 router.get('/getCustomerFuelByType', customersController.getCustomerFuelByType);
 router.get('/getCustomerSales', customersController.getCustomerSales);
+router.get('/getSelfCustomerSales', customersController.getSelfCustomerSales);
 router.get('/getCustomerPayments', customersController.getCustomerPayments);
+router.get('/getSelfCustomerPayments', customersController.getSelfCustomerPayments);
 router.get('/getCustomersDueAmounts', customersController.getCustomersDueAmounts);
+router.get('/getSupplierCustomerDueAmounts', customersController.getSupplierCustomerDueAmounts);
+router.get('/getPumpLocalCustomerDueAmounts', customersController.getPumpLocalCustomerDueAmounts);
 router.post('/addCustomer', customersController.addCustomer);
 router.post('/updateCustomer', customersController.updateCustomer);
 router.delete('/deleteCustomer', customersController.deleteCustomer);
+router.get('/getCustomerDues', customersController.getCustomerDues);
+
+
+router.get('/getSupplierCustomerDues', customersController.getSupplierCustomerDues);
+
+router.get('/getFuelStationCustomers', customersController.getFuelStationCustomers);
+router.get('/getSuppliers', customersController.getSuppliers);
+router.get('/getPumps', customersController.getPumps);
 
 // Drivers
 router.get('/getDrivers', driversController.getDrivers);
@@ -183,6 +224,8 @@ router.delete('/deleteDriver', driversController.deleteDriver);
 
 // Depos
 router.get('/getDepos', deposController.getDepos);
+router.get('/getDepoCreditUsage', deposController.getDepoCreditUsage);
+router.get('/getDeposByCompany', deposController.getDeposByCompany);
 router.get('/getDepo', deposController.getDepo);
 router.get('/checkDepoUsedInTrips', deposController.checkDepoUsedInTrips);
 router.post('/addDepo', deposController.addDepo);
@@ -194,6 +237,7 @@ router.get('/getPools', poolController.getPools);
 router.get('/getPool', poolController.getPool);
 router.get('/getPoolHistory', poolController.getPoolHistory);
 router.post('/addPool', poolController.addPool);
+router.post('/adjustPoolLimit', poolController.adjustPoolLimit);
 router.post('/updatePool', poolController.updatePool);
 router.delete('/deletePool', poolController.deletePool);
 
@@ -235,11 +279,17 @@ router.post('/updateCashInHand', cashInHandController.updateCashInHand);
 router.post('/transferToBank', cashInHandController.transferToBank);
 router.delete('/deleteCashInHand', cashInHandController.deleteCashInHand);
 
+// Cash in Hand Transfers
+router.get('/getCashinHandTransfers', cashInHandController.getCashinHandTransfers);
+router.post('/saveCashinHandTransfers', cashInHandController.saveCashinHandTransfers);
+
 // Recoveries Management
 router.get('/getRecoveries', recoveriesController.getRecoveries);
 router.get('/getRecovery', recoveriesController.getRecovery);
 router.post('/addRecovery', recoveriesController.addRecovery);
 router.delete('/deleteRecovery', recoveriesController.deleteRecovery);
+router.get('/getLocalRecoveries', recoveriesController.getLocalRecoveries);
+router.get('/getSelfRecoveries', recoveriesController.getSelfRecoveries);
 
 // Expense Categories Management
 router.get('/getExpenseCategory', expenseCategoriesController.getExpenseCategory);
@@ -307,6 +357,7 @@ router.get('/getCurrentFuelRate', fuelRatesController.getCurrentFuelRate);
 router.post('/addFuelRate', fuelRatesController.addFuelRate);
 router.post('/updateFuelRate', fuelRatesController.updateFuelRate);
 router.delete('/deleteFuelRate', fuelRatesController.deleteFuelRate);
+router.get('/getLocalCustomers', fuelStationCustomersController.getLocalCustomers);
 
 // Daily Sales Summary
 router.get('/getDailySalesSummaries', dailySalesSummaryController.getDailySalesSummaries);
@@ -355,15 +406,40 @@ router.delete('/deleteFuelStationCustomerVehicle', fuelStationCustomerVehiclesCo
 // Customer Credit Sales & Ledger
 router.get('/getCreditSaleLimit', customerCreditSalesController.getCreditSaleLimit);
 router.get('/getCustomerCreditSales', customerCreditSalesController.getCustomerCreditSales);
+router.get('/getCustomerCreditDue', customerCreditSalesController.getCustomerCreditDue);
 router.get('/getCustomerRecoveryTotal', customerCreditSalesController.getCustomerRecoveryTotal);
 router.post('/addCustomerCreditSale', customerCreditSalesController.addCustomerCreditSale);
 router.get('/getCustomerLedger', customerCreditSalesController.getCustomerLedger);
 router.post('/addCustomerRecovery', customerCreditSalesController.addCustomerRecovery);
+router.get('/getLocalCustomersRecoveryHistory', customerCreditSalesController.getLocalCustomersRecoveryHistory);
 
 // Reports
 router.get('/getPurchaseReport', projectController.getPurchaseReport);
 router.get('/getSaleReport', projectController.getSaleReport);
 router.get('/getCustomersReport', projectController.getCustomersReport);
 router.get('/getCustomerIndividualReport', projectController.getCustomerIndividualReport);
+router.get('/getExpensesReport', projectController.getExpensesReport);
+
+
+// In your routes file
+router.get('/db-status', async (req, res) => {
+    const db = require('../models/db');
+    const status = db.getConnectionStatus();
+    res.json({
+        success: true,
+        data: status,
+        timestamp: new Date().toISOString()
+    });
+});
+
+router.post('/db-force-cleanup', async (req, res) => {
+    const db = require('../models/db');
+    await db.closeAllConnections();
+    res.json({
+        success: true,
+        message: 'All connections closed'
+    });
+});
+
 
 module.exports = router;

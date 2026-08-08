@@ -1,5 +1,19 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return (
+        b.MB ||
+        b.CB ||
+        b.userName ||
+        b.username ||
+        b.UserName ||
+        b.createdBy ||
+        b.modifiedBy ||
+        'System'
+    ).toString().trim() || 'System';
+}
+
 // Get all meter readings
 exports.getMeterReadings = async (req, res) => {
     try {
@@ -7,7 +21,7 @@ exports.getMeterReadings = async (req, res) => {
         const meterId = req.query.meter_id;
         const readingDate = req.query.reading_date;
         const shift = req.query.shift;
-        
+
         let query = `
             SELECT 
                 mr.id,
@@ -36,7 +50,7 @@ exports.getMeterReadings = async (req, res) => {
             WHERE mr.Active = 1
         `;
         const params = [];
-        
+
         if (customerId) {
             query += ' AND mr.customer_id = ?';
             params.push(customerId);
@@ -59,7 +73,7 @@ exports.getMeterReadings = async (req, res) => {
             }
         }
         query += ' ORDER BY mr.reading_date DESC, mr.shift, c.name, m.meter_no';
-        
+
         const [rows] = await db.execute(query, params);
         res.json(rows);
     } catch (err) {
@@ -138,11 +152,11 @@ exports.getMeterReading = async (req, res) => {
             WHERE mr.id = ? AND mr.Active = 1
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Meter Reading not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching meter reading:', err);
@@ -205,10 +219,10 @@ exports.addMeterReading = async (req, res) => {
             WHERE customer_id = ? AND meter_id = ? AND reading_date = ? AND shift = ? AND Active = 1
         `;
         const [existing] = await db.execute(checkQuery, [resolvedCustomerId, meter_id, reading_date, shift]);
-        
+
         if (existing.length > 0) {
-            return res.status(400).json({ 
-                message: 'Meter reading already exists for this station, meter, date, and shift' 
+            return res.status(400).json({
+                message: 'Meter reading already exists for this station, meter, date, and shift'
             });
         }
 
@@ -227,19 +241,15 @@ exports.addMeterReading = async (req, res) => {
         const finalSaleA = isFirstReading ? 0 : (sale_a != null ? parseFloat(sale_a) : null);
         const finalSaleB = isFirstReading ? 0 : (sale_b != null ? parseFloat(sale_b) : null);
 
-        // Get CB (Created By) from request body - required, no default to 'System'
-        const CB = req.body.CB;
-        if (!CB) {
-            return res.status(400).json({ message: 'CB (Created By - username) is required' });
-        }
+        const auditUser = resolveAuditUser(req);
 
         const query = `
             INSERT INTO meter_readings (
                 customer_id, meter_id, reading_date, shift,
                 old_a, new_a, sale_a, old_b, new_b, sale_b,
-                active, CB, CD, MD
+                active, CB, MB, CD, MD
             ) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NOW(), NOW())
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NOW(), NOW())
         `;
 
         const [result] = await db.execute(query, [
@@ -253,7 +263,8 @@ exports.addMeterReading = async (req, res) => {
             old_b || null,
             new_b || null,
             finalSaleB,
-            CB
+            auditUser,
+            auditUser
         ]);
 
         // Tank stock will be updated in batch after all meter readings are saved
@@ -320,42 +331,38 @@ exports.updateMeterReading = async (req, res) => {
             AND id != ? AND Active = 1
         `;
         const [existing] = await db.execute(checkQuery, [resolvedCustomerId, meter_id, reading_date, shift, id]);
-        
+
         if (existing.length > 0) {
-            return res.status(400).json({ 
-                message: 'Meter reading already exists for this station, meter, date, and shift' 
+            return res.status(400).json({
+                message: 'Meter reading already exists for this station, meter, date, and shift'
             });
         }
 
         const activeValue = Active !== undefined ? Active : (active !== undefined ? active : 1);
-        // Get MB (Modified By) from request body - required, no default to 'System'
-        const MB = req.body.MB;
-        if (!MB) {
-            return res.status(400).json({ message: 'MB (Modified By - username) is required' });
-        }
+        const MB = resolveAuditUser(req);
 
         // Verify the meter reading exists and get its current values
         const [existingReadingRows] = await db.execute(
             `SELECT id, customer_id, meter_id, reading_date, shift FROM meter_readings WHERE id = ? AND Active = 1`,
             [id]
         );
-        
+
         if (existingReadingRows.length === 0) {
             return res.status(404).json({ message: 'Meter Reading not found' });
         }
 
         const existingReading = existingReadingRows[0];
-        
+
         // CRITICAL: Prevent editing if stock has been finalized
         // Check if tank stock exists for this meter's tank, date, and shift
         // This prevents data corruption after stock is calculated
-        
+
         // Get meter info to find fuel_type_id and tank
         const [meterRows] = await db.execute(
             `SELECT fuel_type_id FROM meters WHERE id = ? AND Active = 1`,
             [meter_id]
         );
-        
+
         if (meterRows.length > 0 && meterRows[0].fuel_type_id) {
             // Find the tank for this meter
             const [tankRows] = await db.execute(
@@ -364,10 +371,10 @@ exports.updateMeterReading = async (req, res) => {
                  LIMIT 1`,
                 [resolvedCustomerId, meterRows[0].fuel_type_id]
             );
-            
+
             if (tankRows.length > 0) {
                 const tank_id = tankRows[0].id;
-                
+
                 // Check if stock exists for the CURRENT reading's date/shift (before any changes)
                 // Use the existing reading's date/shift, not the new values from request
                 const [stockCheckRows] = await db.execute(
@@ -376,15 +383,15 @@ exports.updateMeterReading = async (req, res) => {
                      LIMIT 1`,
                     [tank_id, existingReading.reading_date, existingReading.shift]
                 );
-                
+
                 if (stockCheckRows.length > 0) {
-                    return res.status(400).json({ 
+                    return res.status(400).json({
                         message: 'Meter reading cannot be edited after tank stock has been finalized for this date and shift. Please contact an administrator to make corrections.',
                         code: 'STOCK_FINALIZED',
                         stock_exists: true
                     });
                 }
-                
+
                 // Also check if user is trying to change date or shift to one that has stock
                 // This prevents moving a reading to a finalized period
                 if (reading_date !== existingReading.reading_date || shift !== existingReading.shift) {
@@ -394,9 +401,9 @@ exports.updateMeterReading = async (req, res) => {
                          LIMIT 1`,
                         [tank_id, reading_date, shift]
                     );
-                    
+
                     if (newStockCheckRows.length > 0) {
-                        return res.status(400).json({ 
+                        return res.status(400).json({
                             message: 'Cannot change reading date/shift to a period where tank stock has already been finalized.',
                             code: 'TARGET_STOCK_FINALIZED',
                             stock_exists: true
@@ -470,15 +477,15 @@ exports.updateMeterReading = async (req, res) => {
 exports.updateTankStockFromReadings = async (req, res) => {
     try {
         const { customer_id, reading_date, shift } = req.body;
-        
+
         if (!customer_id || !reading_date || !shift) {
-            return res.status(400).json({ 
-                message: 'Customer ID, reading date, and shift are required' 
+            return res.status(400).json({
+                message: 'Customer ID, reading date, and shift are required'
             });
         }
-        
+
         console.log(`[Tank Stock Batch] Updating tank stock for customer ${customer_id}, date ${reading_date}, shift ${shift}`);
-        
+
         // Step 1: Sum sales for each tank/date/shift combination
         // For each meter reading, take max(sale_a, sale_b), then sum across all meters for the same tank
         const salesQuery = `
@@ -501,32 +508,32 @@ exports.updateTankStockFromReadings = async (req, res) => {
               AND (mr.sale_a IS NOT NULL OR mr.sale_b IS NOT NULL)
             GROUP BY st.id, st.tank_label, mr.reading_date, mr.shift
         `;
-        
+
         const [salesRows] = await db.execute(salesQuery, [customer_id, reading_date, shift]);
-        
+
         if (salesRows.length === 0) {
             console.log(`[Tank Stock Batch] No sales found for customer ${customer_id}, date ${reading_date}, shift ${shift}`);
-            return res.json({ 
+            return res.json({
                 message: 'No sales found to update tank stock',
-                updated: 0 
+                updated: 0
             });
         }
-        
+
         console.log(`[Tank Stock Batch] Found ${salesRows.length} tank(s) with sales`);
-        
+
         // Step 2: Insert or update ONE stock record per tank/date/shift
         let updatedCount = 0;
-        
+
         for (const saleRow of salesRows) {
             const tank_id = saleRow.tank_id;
             const tank_label = saleRow.tank_label;
             const totalSold = parseFloat(saleRow.total_sold || 0);
-            
+
             if (totalSold <= 0) {
                 console.log(`[Tank Stock Batch] Skipping tank ${tank_id} (${tank_label}) - no sales`);
                 continue;
             }
-            
+
             // Check if stock record exists
             const [existingStockRows] = await db.execute(
                 `SELECT id, opening_stock, received_qty, sold_qty, adjustment_qty, closing_stock
@@ -535,22 +542,18 @@ exports.updateTankStockFromReadings = async (req, res) => {
                  LIMIT 1`,
                 [tank_id, reading_date, shift]
             );
-            
+
             if (existingStockRows.length > 0) {
                 // Update existing record
                 const existing = existingStockRows[0];
                 const newSoldQty = totalSold; // Use the calculated total, not accumulate
-                const newClosingStock = parseFloat(existing.opening_stock || 0) + 
-                                       parseFloat(existing.received_qty || 0) - 
-                                       newSoldQty + 
-                                       parseFloat(existing.adjustment_qty || 0);
-                
-                // Get MB (Modified By) from request body for updates
-                const MB = req.body.CB || req.body.MB; // Use CB as MB if MB not provided
-                if (!MB) {
-                    return res.status(400).json({ message: 'MB (Modified By - username) is required for stock update' });
-                }
-                
+                const newClosingStock = parseFloat(existing.opening_stock || 0) +
+                    parseFloat(existing.received_qty || 0) -
+                    newSoldQty +
+                    parseFloat(existing.adjustment_qty || 0);
+
+                const MB = resolveAuditUser(req);
+
                 await db.execute(
                     `UPDATE station_tank_stock SET 
                         sold_qty = ?,
@@ -560,7 +563,7 @@ exports.updateTankStockFromReadings = async (req, res) => {
                     WHERE id = ?`,
                     [newSoldQty, newClosingStock, MB, existing.id]
                 );
-                
+
                 console.log(`[Tank Stock Batch] ✓ Updated tank ${tank_id} (${tank_label}): Sold=${newSoldQty}L, Balance=${newClosingStock}L`);
             } else {
                 // Create new record - get latest stock to use as opening_stock
@@ -576,41 +579,37 @@ exports.updateTankStockFromReadings = async (req, res) => {
                      LIMIT 1`,
                     [tank_id]
                 );
-                
+
                 const opening_stock = latestStockRows.length > 0 ? parseFloat(latestStockRows[0].closing_stock) : 0;
                 const closing_stock = opening_stock - totalSold;
-                // Get CB (Created By) from request body - required, no default to 'System'
-                const CB = req.body.CB;
-                if (!CB) {
-                    return res.status(400).json({ message: 'CB (Created By) is required for update' });
-                }
-                
+                const CB = resolveAuditUser(req);
+
                 await db.execute(
                     `INSERT INTO station_tank_stock (
                         tank_id, stock_date, shift,
                         opening_stock, received_qty, sold_qty, adjustment_qty, closing_stock,
-                        Active, CB, CD, MD
+                        Active, CB, MB, CD, MD
                     ) 
-                    VALUES (?, ?, ?, ?, 0, ?, 0, ?, 1, ?, NOW(), NOW())`,
-                    [tank_id, reading_date, shift, opening_stock, totalSold, closing_stock, CB]
+                    VALUES (?, ?, ?, ?, 0, ?, 0, ?, 1, ?, ?, NOW(), NOW())`,
+                    [tank_id, reading_date, shift, opening_stock, totalSold, closing_stock, CB, CB]
                 );
-                
+
                 console.log(`[Tank Stock Batch] ✓ Created stock record for tank ${tank_id} (${tank_label}): Sold=${totalSold}L, Balance=${closing_stock}L`);
             }
-            
+
             updatedCount++;
         }
-        
+
         res.json({
             message: `Tank stock updated successfully for ${updatedCount} tank(s)`,
             updated: updatedCount
         });
-        
+
     } catch (err) {
         console.error('[Tank Stock Batch] Error updating tank stock from readings:', err);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: err.message 
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
         });
     }
 };
@@ -619,7 +618,7 @@ exports.updateTankStockFromReadings = async (req, res) => {
 exports.deleteMeterReading = async (req, res) => {
     try {
         const id = req.body.id || req.params.id;
-        
+
         if (!id) {
             return res.status(400).json({ message: 'Meter Reading ID is required' });
         }
@@ -629,21 +628,21 @@ exports.deleteMeterReading = async (req, res) => {
             `SELECT customer_id, meter_id, reading_date, shift FROM meter_readings WHERE id = ? AND Active = 1`,
             [id]
         );
-        
+
         if (readingRows.length === 0) {
             return res.status(404).json({ message: 'Meter Reading not found' });
         }
 
         const reading = readingRows[0];
         const customerId = reading.customer_id;
-        
+
         // CRITICAL: Prevent deletion if stock has been finalized
         // Get meter info to find fuel_type_id and tank
         const [meterRows] = await db.execute(
             `SELECT fuel_type_id FROM meters WHERE id = ? AND Active = 1`,
             [reading.meter_id]
         );
-        
+
         if (meterRows.length > 0 && meterRows[0].fuel_type_id) {
             // Find the tank for this meter
             const [tankRows] = await db.execute(
@@ -652,10 +651,10 @@ exports.deleteMeterReading = async (req, res) => {
                  LIMIT 1`,
                 [customerId, meterRows[0].fuel_type_id]
             );
-            
+
             if (tankRows.length > 0) {
                 const tank_id = tankRows[0].id;
-                
+
                 // Check if stock exists for this reading's date/shift
                 const [stockCheckRows] = await db.execute(
                     `SELECT id FROM station_tank_stock 
@@ -663,9 +662,9 @@ exports.deleteMeterReading = async (req, res) => {
                      LIMIT 1`,
                     [tank_id, reading.reading_date, reading.shift]
                 );
-                
+
                 if (stockCheckRows.length > 0) {
-                    return res.status(400).json({ 
+                    return res.status(400).json({
                         message: 'Meter reading cannot be deleted after tank stock has been finalized for this date and shift. Please contact an administrator to make corrections.',
                         code: 'STOCK_FINALIZED',
                         stock_exists: true
@@ -674,8 +673,9 @@ exports.deleteMeterReading = async (req, res) => {
             }
         }
 
-        const query = 'UPDATE meter_readings SET Active = 0, MD = NOW() WHERE id = ?';
-        const [result] = await db.execute(query, [id]);
+        const MB = resolveAuditUser(req);
+        const query = 'UPDATE meter_readings SET Active = 0, MB = ?, MD = NOW() WHERE id = ?';
+        const [result] = await db.execute(query, [MB, id]);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Meter Reading not found' });
@@ -693,7 +693,7 @@ exports.deleteMeterReading = async (req, res) => {
 exports.canEditMeterReading = async (req, res) => {
     try {
         const id = req.query.id;
-        
+
         if (!id) {
             return res.status(400).json({ message: 'Meter Reading ID is required' });
         }
@@ -703,23 +703,23 @@ exports.canEditMeterReading = async (req, res) => {
             `SELECT customer_id, meter_id, reading_date, shift FROM meter_readings WHERE id = ? AND Active = 1`,
             [id]
         );
-        
+
         if (readingRows.length === 0) {
             return res.status(404).json({ message: 'Meter Reading not found' });
         }
 
         const reading = readingRows[0];
         const customerId = reading.customer_id;
-        
+
         // Get meter info to find fuel_type_id and tank
         const [meterRows] = await db.execute(
             `SELECT fuel_type_id FROM meters WHERE id = ? AND Active = 1`,
             [reading.meter_id]
         );
-        
+
         let canEdit = true;
         let reason = null;
-        
+
         if (meterRows.length > 0 && meterRows[0].fuel_type_id) {
             // Find the tank for this meter
             const [tankRows] = await db.execute(
@@ -728,10 +728,10 @@ exports.canEditMeterReading = async (req, res) => {
                  LIMIT 1`,
                 [customerId, meterRows[0].fuel_type_id]
             );
-            
+
             if (tankRows.length > 0) {
                 const tank_id = tankRows[0].id;
-                
+
                 // Check if stock exists for this reading's date/shift
                 const [stockCheckRows] = await db.execute(
                     `SELECT id FROM station_tank_stock 
@@ -739,7 +739,7 @@ exports.canEditMeterReading = async (req, res) => {
                      LIMIT 1`,
                     [tank_id, reading.reading_date, reading.shift]
                 );
-                
+
                 if (stockCheckRows.length > 0) {
                     canEdit = false;
                     reason = 'Tank stock has been finalized for this date and shift';

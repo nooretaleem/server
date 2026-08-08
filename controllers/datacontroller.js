@@ -1,6 +1,6 @@
 const db = require('../models/db');
 const bcrypt = require("bcrypt");
-const generateAccessToken  = require("../util/generateAccessToken");
+const generateAccessToken = require("../util/generateAccessToken");
 
 exports.getAllUsers = async (req, res) => {
     try {
@@ -15,16 +15,16 @@ exports.login = async (req, res) => {
     try {
         const email = req.body.username;
         const password = req.body.password;
-        
+
         if (!email || !password) {
             return res.status(400).json({ message: 'Email and password are required' });
         }
-        
+
         const [rows] = await db.execute('Select users.id,users.password, users.email, users.name, roles.roletype from users Inner Join '
-        +' roles on users.roleid=roles.id where email = ?', [
+            + ' roles on users.roleid=roles.id where email = ?', [
             email,
         ]);
-        
+
         if (rows.length == 0) {
             console.log("--------> User does not exist")
             return res.status(401).json({ message: 'Incorrect email or password' });
@@ -34,7 +34,7 @@ exports.login = async (req, res) => {
             const userrole = rows[0].roletype;
             const userid = rows[0].id;
             const username = rows[0].name || rows[0].email; // Use name if available, else use email
-            
+
             // Compare password with hashed password
             bcrypt.compare(password, hashedPassword, function (err, result) {
                 if (err) {
@@ -44,9 +44,9 @@ exports.login = async (req, res) => {
                     console.log("---------> Login Successful");
                     // Generate access token
                     const token = generateAccessToken({ email: email, userid: userid });
-                    return res.json({ 
-                        accessToken: token, 
-                        role: userrole, 
+                    return res.json({
+                        accessToken: token,
+                        role: userrole,
                         expiry: new Date().getTime() + 15 * 60 * 1000,
                         userid: userid,
                         name: username
@@ -82,9 +82,10 @@ exports.signup = async (req, res) => {
         else {
             hashPassword(password).then(async (hash) => {
                 //console.log(hash); // the hashed password is available here
+                const createdBy = req.body.CB || req.body.MB || 'System';
                 const [result] = await db.execute(
-                    'INSERT INTO users (name, password, email) VALUES (?, ?, ?)',
-                    [name, hash, email]
+                    'INSERT INTO users (name, password, email, CB, MB) VALUES (?, ?, ?, ?, ?)',
+                    [name, hash, email, createdBy, createdBy]
                 );
                 const [data] = await db.execute('SELECT * FROM users WHERE id = ?', [
                     result.insertId,
@@ -126,17 +127,17 @@ function hashPassword(password) {
 exports.getCurrentUser = async (req, res) => {
     try {
         const userid = req.query.userid;
-        
+
         if (!userid) {
             return res.status(400).json({ message: 'User ID is required' });
         }
-        
+
         const [rows] = await db.execute('SELECT id, name, email FROM users WHERE id = ?', [userid]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'User not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error(err);
@@ -144,26 +145,27 @@ exports.getCurrentUser = async (req, res) => {
     }
 };
 
-exports.getAlowedModules=async(req,res)=>{
-    const username=req.query.username;
-   
-    try{
-        const [rows] = await db.execute('Select users.id,modules.name,modules.link,modules.imagesrc'+
-    ' from users Inner Join roles on users.roleid=roles.id inner join modulesassignment'+
-    ' on modulesassignment.roleid=roles.id inner join modules on modules.id=modulesassignment.moduleid'+
-    ' where email = ?', [
+exports.getAlowedModules = async (req, res) => {
+    const username = req.query.username;
+
+    try {
+        const [rows] = await db.execute('Select users.id,modules.name,modules.link,modules.imagesrc' +
+            ' from users Inner Join roles on users.roleid=roles.id inner join modulesassignment' +
+            ' on modulesassignment.roleid=roles.id inner join modules on modules.id=modulesassignment.moduleid' +
+            ' where email = ?', [
             username,
         ]);
         const category = rows.map(row => ({
             name: row.name,
-            link:row.link,
-            imagesrc:row.imagesrc
+            link: row.link,
+            imagesrc: row.imagesrc
 
         }));
         res.status(200).json(category);
-    }catch (err) {
+    } catch (err) {
         console.error(err);
         res.status(500).json({ message: err });
     }
-    
+
 };
+

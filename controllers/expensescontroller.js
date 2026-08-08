@@ -1,12 +1,24 @@
 const db = require('../models/db');
-const jwt = require('jsonwebtoken');
-const config = require('../config/config.json');
+
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return (
+        b.MB ||
+        b.CB ||
+        b.userName ||
+        b.username ||
+        b.UserName ||
+        b.createdBy ||
+        b.modifiedBy ||
+        'System'
+    ).toString().trim() || 'System';
+}
 
 // Get all expenses
 exports.getExpenses = async (req, res) => {
     try {
         const expense_type = req.query.expense_type; // 'BUSINESS' or 'PERSONAL'
-        
+
         let query = `
             SELECT 
                 e.id,
@@ -28,22 +40,22 @@ exports.getExpenses = async (req, res) => {
             LEFT JOIN transactions t ON e.transaction_id = t.ID
            
         `;
-        
+
         const params = [];
         if (expense_type && (expense_type === 'BUSINESS' || expense_type === 'PERSONAL')) {
             query += ' WHERE  e.active=1 and t.active=1 and ec.expense_type = ?';
             params.push(expense_type);
         }
-        
+
         query += ' ORDER BY e.expense_date , e.CD DESC';
-        
+
         const [rows] = await db.execute(query, params);
         res.json(rows);
     } catch (err) {
         console.error('Error fetching expenses:', err);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: err.message 
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
         });
     }
 };
@@ -52,7 +64,7 @@ exports.getExpenses = async (req, res) => {
 exports.getExpense = async (req, res) => {
     try {
         const id = req.query.id;
-        
+
         if (!id) {
             return res.status(400).json({ message: 'Expense ID is required' });
         }
@@ -79,17 +91,17 @@ exports.getExpense = async (req, res) => {
             WHERE e.active=1 and t.active=1e.id = ?
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Expense not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching expense:', err);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: err.message 
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
         });
     }
 };
@@ -98,27 +110,27 @@ exports.getExpense = async (req, res) => {
 exports.getTotalExpenses = async (req, res) => {
     try {
         const expense_type = req.query.expense_type; // 'BUSINESS' or 'PERSONAL'
-        
+
         let query = `
             SELECT 
                 COALESCE(SUM(e.amount), 0) as total
             FROM expenses e
             LEFT JOIN expense_categories ec ON e.category_id = ec.id 
         `;
-        
+
         const params = [];
         if (expense_type && (expense_type === 'BUSINESS' || expense_type === 'PERSONAL')) {
             query += ' WHERE e.active=1 and ec.expense_type = ?';
             params.push(expense_type);
         }
-        
+
         const [rows] = await db.execute(query, params);
         res.json({ total: parseFloat(rows[0]?.total || 0) });
     } catch (err) {
         console.error('Error fetching total expenses:', err);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: err.message 
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
         });
     }
 };
@@ -162,7 +174,8 @@ exports.addExpense = async (req, res) => {
         }
 
         const connection = await db.getConnection();
-        
+        const auditUser = resolveAuditUser(req);
+
         try {
             await connection.beginTransaction();
 
@@ -199,8 +212,8 @@ exports.addExpense = async (req, res) => {
                 if (currentBalance < amount) {
                     await connection.rollback();
                     connection.release();
-                    return res.status(400).json({ 
-                        message: `Insufficient balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}` 
+                    return res.status(400).json({
+                        message: `Insufficient balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}`
                     });
                 }
             } else if (account_head === 'cash_in_hand') {
@@ -223,9 +236,9 @@ exports.addExpense = async (req, res) => {
                          ORDER BY created_at DESC, id DESC
                          LIMIT 1`
                     );
-                    
+
                     const lastBalance = lastRow.length > 0 ? parseFloat(lastRow[0].balance || 0) : 0;
-                    
+
                     // Create opening balance row: debit=0, credit=0, balance=last row balance
                     const openingBalanceQuery = `
                         INSERT INTO cash_in_hand (
@@ -233,14 +246,18 @@ exports.addExpense = async (req, res) => {
                             debit,
                             credit,
                             balance,
-                            created_at
-                        ) VALUES (?, 0, 0, ?, ?)
+                            created_at,
+                            CB,
+                            MB
+                        ) VALUES (?, 0, 0, ?, ?, ?, ?)
                     `;
-                    
+
                     await connection.execute(openingBalanceQuery, [
                         'Opening Balance',
                         lastBalance, // Balance = last row balance (just copy, no calculation)
-                        expenseDateOnly + ' 00:00:00' // Set to start of day
+                        expenseDateOnly + ' 00:00:00', // Set to start of day
+                        auditUser,
+                        auditUser
                     ]);
                 }
 
@@ -251,21 +268,21 @@ exports.addExpense = async (req, res) => {
                      ORDER BY created_at DESC, id DESC
                      LIMIT 1`
                 );
-                
+
                 const currentBalance = lastBalanceRow.length > 0 ? parseFloat(lastBalanceRow[0].balance || 0) : 0;
-                
+
                 // Step 4: Check if balance is sufficient
                 if (currentBalance < amount) {
                     await connection.rollback();
                     connection.release();
-                    return res.status(400).json({ 
-                        message: `Insufficient cash in hand balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}` 
+                    return res.status(400).json({
+                        message: `Insufficient cash in hand balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}`
                     });
                 }
             }
 
             let cashInHandRecordId = null;
-            
+
             // If cash in hand, insert into cash_in_hand table first to get the ID
             if (account_head === 'cash_in_hand') {
                 // Get previous active row's balance (not calculation)
@@ -275,7 +292,7 @@ exports.addExpense = async (req, res) => {
                      ORDER BY created_at DESC, id DESC
                      LIMIT 1`
                 );
-                
+
                 const previousBalance = previousBalanceRow.length > 0 ? parseFloat(previousBalanceRow[0].balance || 0) : 0;
                 const newBalance = previousBalance - amount; // Balance = Previous balance - expense amount
 
@@ -286,16 +303,20 @@ exports.addExpense = async (req, res) => {
                         debit,
                         credit,
                         balance,
-                        created_at
-                    ) VALUES (?, ?, 0, ?, NOW())
+                        created_at,
+                        CB,
+                        MB
+                    ) VALUES (?, ?, 0, ?, NOW(), ?, ?)
                 `;
-                
+
                 const [cashInHandResult] = await connection.execute(cashInHandQuery, [
                     transactionPurpose,
                     amount, // Debit = expense amount from UI
-                    newBalance // Balance = Previous row balance - expense amount
+                    newBalance, // Balance = Previous row balance - expense amount
+                    auditUser,
+                    auditUser
                 ]);
-                
+
                 cashInHandRecordId = cashInHandResult.insertId;
             }
 
@@ -314,7 +335,7 @@ exports.addExpense = async (req, res) => {
                     active
                 ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 1)
             `;
-            
+
             const [transactionResult] = await connection.execute(transactionQuery, [
                 account_head === 'bank' ? AccountID : null,
                 account_head === 'cash_in_hand' ? cashInHandRecordId : null,
@@ -324,7 +345,7 @@ exports.addExpense = async (req, res) => {
                 account_head === 'bank' ? PaymentMode : null,
                 account_head === 'bank' ? (ReferenceNo || null) : null
             ]);
-            
+
             const transactionID = transactionResult.insertId;
 
             // Update account balance if bank
@@ -337,34 +358,9 @@ exports.addExpense = async (req, res) => {
                 const newBalance = currentBalance - amount; // Debit reduces balance
 
                 await connection.execute(
-                    'UPDATE accounts SET Balance = ? WHERE ID = ?',
-                    [newBalance, AccountID]
+                    'UPDATE accounts SET Balance = ?, MB = ?, MD = NOW() WHERE ID = ?',
+                    [newBalance, auditUser, AccountID]
                 );
-            }
-
-            // Get CB (Created By) from logged-in user
-            let CB = 'System';
-            try {
-                // Get token from headers
-                const token = req.headers.authorization?.replace('Bearer ', '') || req.headers.token;
-                if (token) {
-                    // Decode token to get userid
-                    const decoded = jwt.verify(token, config.privateKey);
-                    const userid = decoded.userid;
-                    
-                    // Query database to get username
-                    const [userRows] = await connection.execute(
-                        'SELECT name, email FROM users WHERE id = ?',
-                        [userid]
-                    );
-                    
-                    if (userRows.length > 0) {
-                        CB = userRows[0].name || userRows[0].email || 'System';
-                    }
-                }
-            } catch (err) {
-                // If token is invalid or user not found, default to 'System'
-                console.log('Error getting username from token:', err.message);
             }
 
             // Insert into expenses table
@@ -376,18 +372,20 @@ exports.addExpense = async (req, res) => {
                     expense_date,
                     description,
                     CB,
+                    MB,
                     CD,
                     active
-                ) VALUES (?, ?, ?, ?, ?, ?, NOW(), 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 1)
             `;
-            
+
             const [expenseResult] = await connection.execute(expenseQuery, [
                 category_id,
                 transactionID,
                 amount,
                 expense_date,
                 description || null,
-                CB
+                auditUser,
+                auditUser
             ]);
 
             await connection.commit();
@@ -407,9 +405,9 @@ exports.addExpense = async (req, res) => {
 
     } catch (err) {
         console.error('Error adding expense:', err);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: err.message 
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
         });
     }
 };
@@ -457,7 +455,8 @@ exports.updateExpense = async (req, res) => {
         }
 
         const connection = await db.getConnection();
-        
+        const auditUser = resolveAuditUser(req);
+
         try {
             await connection.beginTransaction();
 
@@ -503,15 +502,15 @@ exports.updateExpense = async (req, res) => {
                     const currentBalance = parseFloat(accountRows[0].Balance) || 0;
                     const newBalance = currentBalance + oldAmount; // Add back the old amount
                     await connection.execute(
-                        'UPDATE accounts SET Balance = ? WHERE ID = ?',
-                        [newBalance, oldAccountID]
+                        'UPDATE accounts SET Balance = ?, MB = ?, MD = NOW() WHERE ID = ?',
+                        [newBalance, auditUser, oldAccountID]
                     );
                 }
             } else if (oldCashInHandId) {
                 // Reverse cash in hand - delete the old cash_in_hand record
                 await connection.execute(
-                    'DELETE FROM cash_in_hand WHERE id = ?',
-                    [oldCashInHandId]
+                    'UPDATE cash_in_hand SET Active = 0, MB = ?, MD = NOW() WHERE id = ? AND Active = 1',
+                    [auditUser, oldCashInHandId]
                 );
             }
 
@@ -547,8 +546,8 @@ exports.updateExpense = async (req, res) => {
                 if (currentBalance < amount) {
                     await connection.rollback();
                     connection.release();
-                    return res.status(400).json({ 
-                        message: `Insufficient balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}` 
+                    return res.status(400).json({
+                        message: `Insufficient balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}`
                     });
                 }
             } else if (account_head === 'cash_in_hand') {
@@ -571,9 +570,9 @@ exports.updateExpense = async (req, res) => {
                          ORDER BY created_at DESC, id DESC
                          LIMIT 1`
                     );
-                    
+
                     const lastBalance = lastRow.length > 0 ? parseFloat(lastRow[0].balance || 0) : 0;
-                    
+
                     // Create opening balance row: debit=0, credit=0, balance=last row balance
                     const openingBalanceQuery = `
                         INSERT INTO cash_in_hand (
@@ -581,14 +580,18 @@ exports.updateExpense = async (req, res) => {
                             debit,
                             credit,
                             balance,
-                            created_at
-                        ) VALUES (?, 0, 0, ?, ?)
+                            created_at,
+                            CB,
+                            MB
+                        ) VALUES (?, 0, 0, ?, ?, ?, ?)
                     `;
-                    
+
                     await connection.execute(openingBalanceQuery, [
                         'Opening Balance',
                         lastBalance, // Balance = last row balance (just copy, no calculation)
-                        expenseDateOnly + ' 00:00:00' // Set to start of day
+                        expenseDateOnly + ' 00:00:00', // Set to start of day
+                        auditUser,
+                        auditUser
                     ]);
                 }
 
@@ -599,21 +602,21 @@ exports.updateExpense = async (req, res) => {
                      ORDER BY created_at DESC, id DESC
                      LIMIT 1`
                 );
-                
+
                 const currentBalance = lastBalanceRow.length > 0 ? parseFloat(lastBalanceRow[0].balance || 0) : 0;
-                
+
                 // Step 4: Check if balance is sufficient
                 if (currentBalance < amount) {
                     await connection.rollback();
                     connection.release();
-                    return res.status(400).json({ 
-                        message: `Insufficient cash in hand balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}` 
+                    return res.status(400).json({
+                        message: `Insufficient cash in hand balance. Available balance: ${currentBalance.toFixed(2)}, Required: ${amount.toFixed(2)}`
                     });
                 }
             }
 
             let newCashInHandRecordId = null;
-            
+
             // If cash in hand, insert new cash_in_hand record
             if (account_head === 'cash_in_hand') {
                 // Get previous active row's balance (not calculation)
@@ -623,7 +626,7 @@ exports.updateExpense = async (req, res) => {
                      ORDER BY created_at DESC, id DESC
                      LIMIT 1`
                 );
-                
+
                 const previousBalance = previousBalanceRow.length > 0 ? parseFloat(previousBalanceRow[0].balance || 0) : 0;
                 const newBalance = previousBalance - amount; // Balance = Previous balance - expense amount
 
@@ -634,16 +637,20 @@ exports.updateExpense = async (req, res) => {
                         debit,
                         credit,
                         balance,
-                        created_at
-                    ) VALUES (?, ?, 0, ?, NOW())
+                        created_at,
+                        CB,
+                        MB
+                    ) VALUES (?, ?, 0, ?, NOW(), ?, ?)
                 `;
-                
+
                 const [cashInHandResult] = await connection.execute(cashInHandQuery, [
                     transactionPurpose,
                     amount, // Debit = expense amount from UI
-                    newBalance // Balance = Previous row balance - expense amount
+                    newBalance, // Balance = Previous row balance - expense amount
+                    auditUser,
+                    auditUser
                 ]);
-                
+
                 newCashInHandRecordId = cashInHandResult.insertId;
             }
 
@@ -660,7 +667,7 @@ exports.updateExpense = async (req, res) => {
                     ReferenceNo = ?
                 WHERE ID = ?
             `;
-            
+
             await connection.execute(transactionQuery, [
                 account_head === 'bank' ? AccountID : null,
                 account_head === 'cash_in_hand' ? newCashInHandRecordId : null,
@@ -682,8 +689,8 @@ exports.updateExpense = async (req, res) => {
                 const newBalance = currentBalance - amount; // Debit reduces balance
 
                 await connection.execute(
-                    'UPDATE accounts SET Balance = ? WHERE ID = ?',
-                    [newBalance, AccountID]
+                    'UPDATE accounts SET Balance = ?, MB = ?, MD = NOW() WHERE ID = ?',
+                    [newBalance, auditUser, AccountID]
                 );
             }
 
@@ -693,15 +700,18 @@ exports.updateExpense = async (req, res) => {
                 SET category_id = ?,
                     amount = ?,
                     expense_date = ?,
-                    description = ?
+                    description = ?,
+                    MB = ?,
+                    MD = NOW()
                 WHERE id = ?
             `;
-            
+
             await connection.execute(expenseQuery, [
                 category_id,
                 amount,
                 expense_date,
                 description || null,
+                auditUser,
                 id
             ]);
 
@@ -720,9 +730,9 @@ exports.updateExpense = async (req, res) => {
 
     } catch (err) {
         console.error('Error updating expense:', err);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: err.message 
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
         });
     }
 };
@@ -738,7 +748,8 @@ exports.deleteExpense = async (req, res) => {
         }
 
         const connection = await db.getConnection();
-        
+        const auditUser = resolveAuditUser(req);
+
         try {
             await connection.beginTransaction();
 
@@ -777,8 +788,8 @@ exports.deleteExpense = async (req, res) => {
                         const currentBalance = parseFloat(accountRows[0].Balance) || 0;
                         const newBalance = currentBalance + amount; // Add back the amount
                         await connection.execute(
-                            'UPDATE accounts SET Balance = ? WHERE ID = ?',
-                            [newBalance, transaction.AccountID]
+                            'UPDATE accounts SET Balance = ?, MB = ?, MD = NOW() WHERE ID = ?',
+                            [newBalance, auditUser, transaction.AccountID]
                         );
                     }
                 } else if (transaction.cash_in_hand_id) {
@@ -796,8 +807,8 @@ exports.deleteExpense = async (req, res) => {
 
                         // Set Active=0 for the cash_in_hand record
                         await connection.execute(
-                            'UPDATE cash_in_hand SET Active = 0 WHERE id = ?',
-                            [deletedRecordId]
+                            'UPDATE cash_in_hand SET Active = 0, MB = ?, MD = NOW() WHERE id = ?',
+                            [auditUser, deletedRecordId]
                         );
 
                         // Recalculate balances for all subsequent records
@@ -814,10 +825,10 @@ exports.deleteExpense = async (req, res) => {
                         for (const record of subsequentRows) {
                             const currentBalance = parseFloat(record.balance || 0);
                             const newBalance = currentBalance + deletedAmount; // Add back the deleted amount
-                            
+
                             await connection.execute(
-                                'UPDATE cash_in_hand SET balance = ? WHERE id = ?',
-                                [newBalance, record.id]
+                                'UPDATE cash_in_hand SET balance = ?, MB = ?, MD = NOW() WHERE id = ?',
+                                [newBalance, auditUser, record.id]
                             );
                         }
                     }
@@ -825,15 +836,15 @@ exports.deleteExpense = async (req, res) => {
 
                 // Delete transaction
                 await connection.execute(
-                     'UPDATE transactions SET Active = 0 WHERE ID = ?',
-                     [transactionID]
+                    'UPDATE transactions SET Active = 0 WHERE ID = ?',
+                    [transactionID]
                 );
             }
 
             // Delete expense
             await connection.execute(
-                'UPDATE expenses SET Active = 0 WHERE ID = ?',
-                [id]
+                'UPDATE expenses SET Active = 0, MB = ?, MD = NOW() WHERE ID = ?',
+                [auditUser, id]
             );
 
             await connection.commit();
@@ -851,9 +862,9 @@ exports.deleteExpense = async (req, res) => {
 
     } catch (err) {
         console.error('Error deleting expense:', err);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: err.message 
+        res.status(500).json({
+            message: 'Server Error',
+            error: err.message
         });
     }
 };

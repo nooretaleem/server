@@ -1,5 +1,10 @@
 const db = require('../models/db');
 
+function resolveAuditUser(req) {
+    const b = req.body || {};
+    return b.MB || b.CB || b.userName || b.username || b.UserName || b.createdBy || b.modifiedBy || 'System';
+}
+
 // Get all daily sales summaries
 exports.getDailySalesSummaries = async (req, res) => {
     try {
@@ -8,7 +13,7 @@ exports.getDailySalesSummaries = async (req, res) => {
         const saleDate = req.query.sale_date;
         const startDate = req.query.start_date;
         const endDate = req.query.end_date;
-        
+
         let query = `
             SELECT 
                 dss.id,
@@ -31,7 +36,7 @@ exports.getDailySalesSummaries = async (req, res) => {
             WHERE dss.Active = 1
         `;
         const params = [];
-        
+
         if (stationId) {
             query += ' AND dss.station_id = ?';
             params.push(stationId);
@@ -48,9 +53,9 @@ exports.getDailySalesSummaries = async (req, res) => {
             query += ' AND dss.sale_date BETWEEN ? AND ?';
             params.push(startDate, endDate);
         }
-        
+
         query += ' ORDER BY dss.sale_date DESC, c.name, ft.name';
-        
+
         const [rows] = await db.execute(query, params);
         res.json(rows);
     } catch (err) {
@@ -93,11 +98,11 @@ exports.getDailySalesSummary = async (req, res) => {
             WHERE dss.id = ? AND dss.Active = 1
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Daily Sales Summary not found' });
         }
-        
+
         res.json(rows[0]);
     } catch (err) {
         console.error('Error fetching daily sales summary:', err);
@@ -133,7 +138,7 @@ exports.addDailySalesSummary = async (req, res) => {
             WHERE station_id = ? AND fuel_type_id = ? AND sale_date = ? AND Active = 1
         `;
         const [existing] = await db.execute(checkQuery, [station_id, fuel_type_id, sale_date]);
-        
+
         if (existing.length > 0) {
             // Get existing credit_sale so cash_sale = total_amount - credit_sale (all sales into cash, minus what's already credit)
             const [existingRow] = await db.execute(
@@ -154,21 +159,17 @@ exports.addDailySalesSummary = async (req, res) => {
                     MD = NOW()
                 WHERE id = ?
             `;
-            // Get CB (Created By) from request body - required, no default to 'System'
-            const CB = req.body.CB;
-            if (!CB) {
-                return res.status(400).json({ message: 'CB (Created By - username) is required' });
-            }
+            const auditUser = resolveAuditUser(req);
 
             const [updateResult] = await db.execute(updateQuery, [
                 total_liters || null,
                 rate || null,
                 calculatedAmount,
                 newCashSale,
-                CB,
+                auditUser,
                 existing[0].id
             ]);
-            
+
             return res.json({
                 message: 'Daily sales summary updated successfully',
                 id: existing[0].id,
@@ -186,7 +187,7 @@ exports.addDailySalesSummary = async (req, res) => {
             }
         }
 
-        const CB = req.body.CB || 'System';
+        const CB = resolveAuditUser(req);
 
         // When creating from meter readings: all sales amount goes into cash_sale; credit_sale = 0
         const query = `
@@ -194,9 +195,9 @@ exports.addDailySalesSummary = async (req, res) => {
                 station_id, fuel_type_id, sale_date,
                 total_liters, rate, total_amount,
                 credit_sale, cash_sale,
-                active, CB, CD, MD
+                active, CB, MB, CD, MD
             ) 
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?, NOW(), NOW())
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?, ?, NOW(), NOW())
         `;
 
         const [result] = await db.execute(query, [
@@ -207,6 +208,7 @@ exports.addDailySalesSummary = async (req, res) => {
             rate || null,
             calculatedAmount,
             calculatedAmount,
+            CB,
             CB
         ]);
 
@@ -261,10 +263,10 @@ exports.updateDailySalesSummary = async (req, res) => {
             AND id != ? AND Active = 1
         `;
         const [existing] = await db.execute(checkQuery, [station_id, fuel_type_id, sale_date, id]);
-        
+
         if (existing.length > 0) {
-            return res.status(400).json({ 
-                message: 'Daily sales summary already exists for this station, fuel type, and date' 
+            return res.status(400).json({
+                message: 'Daily sales summary already exists for this station, fuel type, and date'
             });
         }
 
@@ -279,11 +281,7 @@ exports.updateDailySalesSummary = async (req, res) => {
         }
 
         const activeValue = Active !== undefined ? Active : (active !== undefined ? active : 1);
-        // Get MB (Modified By) from request body - required, no default to 'System'
-        const MB = req.body.MB;
-        if (!MB) {
-            return res.status(400).json({ message: 'MB (Modified By - username) is required' });
-        }
+        const MB = resolveAuditUser(req);
 
         // cash_sale = total_amount - credit_sale so cash + credit = total
         const [existingRow] = await db.execute(
@@ -340,13 +338,14 @@ exports.updateDailySalesSummary = async (req, res) => {
 exports.deleteDailySalesSummary = async (req, res) => {
     try {
         const id = req.body.id || req.params.id;
-        
+
         if (!id) {
             return res.status(400).json({ message: 'Daily Sales Summary ID is required' });
         }
 
-        const query = 'UPDATE daily_sales_summary SET Active = 0, MD = NOW() WHERE id = ?';
-        const [result] = await db.execute(query, [id]);
+        const MB = resolveAuditUser(req);
+        const query = 'UPDATE daily_sales_summary SET Active = 0, MB = ?, MD = NOW() WHERE id = ?';
+        const [result] = await db.execute(query, [MB, id]);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Daily Sales Summary not found' });

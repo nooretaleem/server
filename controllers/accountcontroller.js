@@ -10,56 +10,70 @@ const isVercel = process.env.VERCEL === '1' || process.env.VERCEL_ENV;
 let storage;
 
 if (isVercel) {
-  // For Vercel: Use memory storage and upload to cloud storage
-  // Note: You'll need to implement cloud storage (AWS S3, Cloudinary, or Vercel Blob)
-  console.warn('⚠️  Running on Vercel - File storage requires cloud storage setup');
-  console.warn('⚠️  Current implementation uses memory storage (files will be lost)');
-  console.warn('⚠️  Please configure cloud storage (AWS S3, Cloudinary, or Vercel Blob)');
-  
-  // Use memory storage as fallback (files will be lost when function ends)
-  // TODO: Implement cloud storage upload
-  storage = multer.memoryStorage();
+    // For Vercel: Use memory storage and upload to cloud storage
+    // Note: You'll need to implement cloud storage (AWS S3, Cloudinary, or Vercel Blob)
+    console.warn('⚠️  Running on Vercel - File storage requires cloud storage setup');
+    console.warn('⚠️  Current implementation uses memory storage (files will be lost)');
+    console.warn('⚠️  Please configure cloud storage (AWS S3, Cloudinary, or Vercel Blob)');
+
+    // Use memory storage as fallback (files will be lost when function ends)
+    // TODO: Implement cloud storage upload
+    storage = multer.memoryStorage();
 } else {
-  // For local development: Use disk storage
-  storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-      const uploadDir = path.join(__dirname, '../uploads/qrcodes/');
-      // Create directory if it doesn't exist
-      if (!fs.existsSync(uploadDir)) {
-        fs.mkdirSync(uploadDir, { recursive: true });
-      }
-      cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-      // Generate unique filename: timestamp-accountId-originalname
-      const accountId = req.params.id || 'unknown';
-      const uniqueSuffix = Date.now() + '-' + accountId;
-      const ext = path.extname(file.originalname);
-      cb(null, uniqueSuffix + ext);
-    }
-  });
+    // For local development: Use disk storage
+    storage = multer.diskStorage({
+        destination: (req, file, cb) => {
+            const uploadDir = path.join(__dirname, '../uploads/qrcodes/');
+            // Create directory if it doesn't exist
+            if (!fs.existsSync(uploadDir)) {
+                fs.mkdirSync(uploadDir, { recursive: true });
+            }
+            cb(null, uploadDir);
+        },
+        filename: (req, file, cb) => {
+            // Generate unique filename: timestamp-accountId-originalname
+            const accountId = req.params.id || 'unknown';
+            const uniqueSuffix = Date.now() + '-' + accountId;
+            const ext = path.extname(file.originalname);
+            cb(null, uniqueSuffix + ext);
+        }
+    });
 }
 
 // File filter to accept only images
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = /jpeg|jpg|png|gif|webp/;
-  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = allowedTypes.test(file.mimetype);
-  
-  if (extname && mimetype) {
-    return cb(null, true);
-  } else {
-    cb(new Error('Only image files (jpeg, jpg, png, gif, webp) are allowed!'));
-  }
+    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+
+    if (extname && mimetype) {
+        return cb(null, true);
+    } else {
+        cb(new Error('Only image files (jpeg, jpg, png, gif, webp) are allowed!'));
+    }
 };
 
 const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
-  },
-  fileFilter: fileFilter
+    storage: storage,
+    limits: {
+        fileSize: 5 * 1024 * 1024 // 5MB limit
+    },
+    fileFilter: fileFilter
 });
+
+function resolveAuditUser(req) {
+    const body = req.body || {};
+    return (
+        body.MB ||
+        body.CB ||
+        body.userName ||
+        body.username ||
+        body.UserName ||
+        body.createdBy ||
+        body.modifiedBy ||
+        'System'
+    ).toString().trim() || 'System';
+}
 
 // Get all active accounts (for recovery dropdown - no bankId required)
 exports.getActiveAccounts = async (req, res) => {
@@ -95,6 +109,7 @@ exports.getAccounts = async (req, res) => {
                 a.BankID,
                 a.AccountNo,
                 a.AccountTitle,
+                a.OpeningBalance,
                 a.Balance,
                 a.QrImagePath,
                 a.CD,
@@ -104,18 +119,18 @@ exports.getAccounts = async (req, res) => {
             FROM accounts a
             LEFT JOIN transactions t ON t.AccountID = a.ID AND t.active = 1
             WHERE a.BankID = ? AND a.active = 1
-            GROUP BY a.ID, a.BankID, a.AccountNo, a.AccountTitle, a.Balance, a.QrImagePath, a.CD, a.MD, a.active
+            GROUP BY a.ID, a.BankID, a.AccountNo, a.AccountTitle, a.OpeningBalance, a.Balance, a.QrImagePath, a.CD, a.MD, a.active
             ORDER BY a.ID DESC
         `;
         const [rows] = await db.execute(query, [bankId]);
-        
+
         // Add hasReferences flag to each account
         const accountsWithReferences = rows.map(account => ({
             ...account,
             transactionCount: parseInt(account.transactionCount) || 0,
             hasReferences: (parseInt(account.transactionCount) || 0) > 0
         }));
-        
+
         res.json(accountsWithReferences);
     } catch (err) {
         console.error('Error fetching accounts:', err);
@@ -150,11 +165,11 @@ exports.getAccount = async (req, res) => {
             WHERE ID = ? AND active = 1
         `;
         const [rows] = await db.execute(query, [id]);
-        
+
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Account not found' });
         }
-        
+
         // Check if account has references in transactions table
         const [transactionRows] = await db.execute(
             'SELECT COUNT(*) as count FROM transactions WHERE AccountID = ? AND active = 1',
@@ -167,7 +182,7 @@ exports.getAccount = async (req, res) => {
         accountData.hasReferences = hasReferences;
         accountData.transactionCount = transactionCount;
         accountData.paymentCount = 0;
-        
+
         res.json(accountData);
     } catch (err) {
         console.error('Error fetching account:', err);
@@ -178,6 +193,7 @@ exports.getAccount = async (req, res) => {
 // Add new account
 exports.addAccount = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const {
             BankID,
             AccountNo,
@@ -223,30 +239,32 @@ exports.addAccount = async (req, res) => {
         if (duplicateRows.length > 0) {
             const duplicate = duplicateRows[0];
             if (duplicate.AccountNo === AccountNo && duplicate.AccountTitle === AccountTitle) {
-                return res.status(400).json({ 
-                    message: 'An account with the same account number and account title already exists in this bank branch.' 
+                return res.status(400).json({
+                    message: 'An account with the same account number and account title already exists in this bank branch.'
                 });
             } else if (duplicate.AccountNo === AccountNo) {
-                return res.status(400).json({ 
-                    message: 'An account with the same account number already exists in this bank branch.' 
+                return res.status(400).json({
+                    message: 'An account with the same account number already exists in this bank branch.'
                 });
             } else if (duplicate.AccountTitle === AccountTitle) {
-                return res.status(400).json({ 
-                    message: 'An account with the same account title already exists in this bank branch.' 
+                return res.status(400).json({
+                    message: 'An account with the same account title already exists in this bank branch.'
                 });
             }
         }
 
         const query = `
-            INSERT INTO accounts (BankID, AccountNo, AccountTitle, Balance, active) 
-            VALUES (?, ?, ?, ?, 1)
+            INSERT INTO accounts (BankID, AccountNo, AccountTitle, Balance, CB, MB, active) 
+            VALUES (?, ?, ?, ?, ?, ?, 1)
         `;
 
         const [result] = await db.execute(query, [
             BankID,
             AccountNo,
             AccountTitle,
-            Balance || 0
+            Balance || 0,
+            auditUser,
+            auditUser
         ]);
 
         res.json({
@@ -266,6 +284,7 @@ exports.addAccount = async (req, res) => {
 // Update account
 exports.updateAccount = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const {
             ID,
             BankID,
@@ -324,14 +343,14 @@ exports.updateAccount = async (req, res) => {
 
             // If trying to change AccountNo or Balance, show error
             if (AccountNo !== currentAccountNo) {
-                return res.status(400).json({ 
-                    message: `Cannot change account number. This account is currently being used in ${transactionCount} transaction${transactionCount > 1 ? 's' : ''}.` 
+                return res.status(400).json({
+                    message: `Cannot change account number. This account is currently being used in ${transactionCount} transaction${transactionCount > 1 ? 's' : ''}.`
                 });
             }
 
             if (Math.abs(newBalance - currentBalance) > 0.01) {
-                return res.status(400).json({ 
-                    message: `Cannot change account balance. This account is currently being used in ${transactionCount} transaction${transactionCount > 1 ? 's' : ''}.` 
+                return res.status(400).json({
+                    message: `Cannot change account balance. This account is currently being used in ${transactionCount} transaction${transactionCount > 1 ? 's' : ''}.`
                 });
             }
             // Check for duplicate account title only (AccountNo and Balance cannot be changed)
@@ -354,8 +373,8 @@ exports.updateAccount = async (req, res) => {
             ]);
 
             if (duplicateTitleRows.length > 0) {
-                return res.status(400).json({ 
-                    message: 'An account with the same account title already exists in this bank branch.' 
+                return res.status(400).json({
+                    message: 'An account with the same account title already exists in this bank branch.'
                 });
             }
 
@@ -363,12 +382,14 @@ exports.updateAccount = async (req, res) => {
             const query = `
                 UPDATE accounts SET 
                     AccountTitle = ?,
+                    MB = ?,
                     MD = NOW()
                 WHERE ID = ? AND active = 1
             `;
 
             const [result] = await db.execute(query, [
                 AccountTitle,
+                auditUser,
                 ID
             ]);
 
@@ -376,8 +397,8 @@ exports.updateAccount = async (req, res) => {
                 return res.status(404).json({ message: 'Account not found' });
             }
 
-            return res.json({ 
-                message: 'Account title updated successfully. Account number and balance cannot be changed as the account has transaction history.' 
+            return res.json({
+                message: 'Account title updated successfully. Account number and balance cannot be changed as the account has transaction history.'
             });
         }
 
@@ -405,16 +426,16 @@ exports.updateAccount = async (req, res) => {
         if (duplicateRows.length > 0) {
             const duplicate = duplicateRows[0];
             if (duplicate.AccountNo === AccountNo && duplicate.AccountTitle === AccountTitle) {
-                return res.status(400).json({ 
-                    message: 'An account with the same account number and account title already exists in this bank branch.' 
+                return res.status(400).json({
+                    message: 'An account with the same account number and account title already exists in this bank branch.'
                 });
             } else if (duplicate.AccountNo === AccountNo) {
-                return res.status(400).json({ 
-                    message: 'An account with the same account number already exists in this bank branch.' 
+                return res.status(400).json({
+                    message: 'An account with the same account number already exists in this bank branch.'
                 });
             } else if (duplicate.AccountTitle === AccountTitle) {
-                return res.status(400).json({ 
-                    message: 'An account with the same account title already exists in this bank branch.' 
+                return res.status(400).json({
+                    message: 'An account with the same account title already exists in this bank branch.'
                 });
             }
         }
@@ -424,6 +445,7 @@ exports.updateAccount = async (req, res) => {
                 AccountNo = ?,
                 AccountTitle = ?,
                 Balance = ?,
+                MB = ?,
                 MD = NOW()
             WHERE ID = ? AND active = 1
         `;
@@ -432,6 +454,7 @@ exports.updateAccount = async (req, res) => {
             AccountNo,
             AccountTitle,
             Balance || 0,
+            auditUser,
             ID
         ]);
 
@@ -449,6 +472,7 @@ exports.updateAccount = async (req, res) => {
 // Delete account (soft delete - set Active = 0)
 exports.deleteAccount = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const { id } = req.body;
 
         if (!id) {
@@ -463,15 +487,15 @@ exports.deleteAccount = async (req, res) => {
         const transactionCount = transactionRows[0]?.count || 0;
 
         if (transactionCount > 0) {
-            return res.status(400).json({ 
-                message: `Cannot delete this account. It is currently being used in ${transactionCount} transaction${transactionCount > 1 ? 's' : ''}.` 
+            return res.status(400).json({
+                message: `Cannot delete this account. It is currently being used in ${transactionCount} transaction${transactionCount > 1 ? 's' : ''}.`
             });
         }
 
         // Note: AccountID is in transactions table, not payments table
 
         // Soft delete: set Active = 0 instead of deleting the record
-        const [result] = await db.execute('UPDATE accounts SET active = 0, MD = NOW() WHERE ID = ?', [id]);
+        const [result] = await db.execute('UPDATE accounts SET active = 0, MB = ?, MD = NOW() WHERE ID = ?', [auditUser, id]);
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: 'Account not found' });
@@ -487,8 +511,9 @@ exports.deleteAccount = async (req, res) => {
 // Upload QR code image for an account
 exports.uploadQrCode = async (req, res) => {
     try {
+        const auditUser = resolveAuditUser(req);
         const accountId = req.params.id;
-        
+
         if (!accountId) {
             return res.status(400).json({ message: 'Account ID is required' });
         }
@@ -521,12 +546,12 @@ exports.uploadQrCode = async (req, res) => {
             // TODO: Implement cloud storage upload (AWS S3, Cloudinary, or Vercel Blob)
             // For now, return error indicating cloud storage is needed
             console.error('⚠️  Vercel deployment detected - Cloud storage required');
-            return res.status(501).json({ 
+            return res.status(501).json({
                 message: 'File upload not configured for Vercel. Please set up cloud storage (AWS S3, Cloudinary, or Vercel Blob).',
                 error: 'Cloud storage not configured',
                 hint: 'See VERCEL_DEPLOYMENT.md for setup instructions'
             });
-            
+
             // Example implementation structure (uncomment and configure):
             /*
             const { put } = require('@vercel/blob'); // or AWS S3, Cloudinary, etc.
@@ -545,7 +570,7 @@ exports.uploadQrCode = async (req, res) => {
             const serverRoot = path.join(__dirname, '../'); // D:\POL\pol\server
             const relativePath = path.relative(serverRoot, req.file.path);
             filePath = relativePath.replace(/\\/g, '/'); // Convert backslashes to forward slashes
-            
+
             console.log('File upload details:');
             console.log('  Server root:', serverRoot);
             console.log('  Full file path:', req.file.path);
@@ -554,10 +579,10 @@ exports.uploadQrCode = async (req, res) => {
         }
 
         await db.execute(
-            'UPDATE accounts SET QrImagePath = ?, MD = NOW() WHERE ID = ?',
-            [filePath, accountId]
+            'UPDATE accounts SET QrImagePath = ?, MB = ?, MD = NOW() WHERE ID = ?',
+            [filePath, auditUser, accountId]
         );
-        
+
         console.log('QR path saved to database for account:', accountId);
 
         // Delete old QR image if it exists and is different from new one
@@ -565,7 +590,7 @@ exports.uploadQrCode = async (req, res) => {
         if (oldQrPath && oldQrPath !== filePath) {
             const deleteOldFile = async (filePathToDelete, retries = 3) => {
                 const oldFullPath = path.join(__dirname, '../', filePathToDelete);
-                
+
                 if (!fs.existsSync(oldFullPath)) {
                     return; // File doesn't exist, nothing to delete
                 }
@@ -616,7 +641,7 @@ exports.uploadQrCode = async (req, res) => {
         // Verify file exists before responding
         if (!fs.existsSync(req.file.path)) {
             console.error('Uploaded file does not exist at path:', req.file.path);
-            return res.status(500).json({ 
+            return res.status(500).json({
                 message: 'File upload failed - file not found on server',
                 error: 'File not found'
             });
