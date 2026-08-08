@@ -12,7 +12,7 @@ const backupService = require('./services/backupService');
 // Middleware
 // CORS configuration to allow frontend origin
 const allowedOrigins = new Set([
-  'http://localhost:4200',
+   'http://localhost:4200',
   'http://localhost:5000',
   'https://zeeshanpetrolium.vercel.app',
   'https://www.zeeshanpetrolium.vercel.app',
