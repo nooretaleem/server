@@ -22,7 +22,7 @@ const config = {
     host: process.env.DB_HOST || defaultConfig.host || 'localhost',
     user: process.env.DB_USER || defaultConfig.user || 'root',
     password: process.env.DB_PASSWORD || defaultConfig.password || '',
-    database: process.env.DB_NAME || defaultConfig.database || 'petroerp',
+    database: process.env.DB_NAME || defaultConfig.database || 'pol_wholesale',
     port: parseInt(process.env.DB_PORT) || defaultConfig.port || 3306,
     ssl: process.env.DB_SSL === 'true' || defaultConfig.ssl || false,
     sslCa: process.env.DB_SSL_CA || defaultConfig.sslCa || '',
