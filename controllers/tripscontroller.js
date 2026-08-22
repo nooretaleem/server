@@ -54,9 +54,10 @@ async function checkAndCloseTrip(connection, tripId) {
             );
             console.log(`Trip ${tripId} status updated to Completed - all payments/recoveries cleared and all fuel sold`);
         }
+        return true;
     } catch (err) {
-        console.error(`Error checking/completing trip ${tripId}:`, err);
-        // Don't throw error, just log it
+        console.error(`[checkAndCloseTrip] Failed for trip ${tripId}:`, err);
+        return false;
     }
 }
 
@@ -4062,7 +4063,7 @@ exports.getDepoRemainingAmount = async (req, res) => {
         const [remainingBalanceRows] = await db.execute(
             `SELECT COALESCE(SUM(payable_amount - COALESCE(paid_amount, 0)), 0) as remaining_balance
             FROM trip_depos
-            WHERE depo_id = 28
+            WHERE depo_id = ?
             AND (purchase_type = 'credit' OR purchase_type = 'specialcredit')
             AND Active = 1
             AND (payable_amount - COALESCE(paid_amount, 0)) > 0`,
@@ -5352,7 +5353,10 @@ exports.addSale = async (req, res) => {
         }
 
         // Check if trip should be closed (all payments cleared and all fuel sold)
-        await checkAndCloseTrip(connection, trip_id);
+        const tripCloseResult = await checkAndCloseTrip(connection, trip_id);
+        if (!tripCloseResult) {
+            console.warn(`[Trip Status Warning] Trip ${trip_id} could not be evaluated/closed. Financial transaction will continue.`);
+        }
 
         await connection.commit();
 

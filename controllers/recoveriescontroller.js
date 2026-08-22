@@ -54,9 +54,10 @@ async function checkAndCloseTrip(connection, tripId) {
             );
             console.log(`Trip ${tripId} status updated to Completed - all payments/recoveries cleared and all fuel sold`);
         }
+        return true;
     } catch (err) {
-        console.error(`Error checking/completing trip ${tripId}:`, err);
-        // Don't throw error, just log it
+        console.error(`[checkAndCloseTrip] Failed for trip ${tripId}:`, err);
+        return false;
     }
 }
 
@@ -1790,7 +1791,10 @@ exports.addRecovery = async (req, res) => {
                             // ============================================================
                             // STEP 6: CHECK AND CLOSE TRIP IF ALL PAYMENTS CLEARED
                             // ============================================================
-                            await checkAndCloseTrip(connection, trip.id);
+                            const tripCloseResult = await checkAndCloseTrip(connection, trip.id);
+                            if (!tripCloseResult) {
+                                console.warn(`[Trip Status Warning] Trip ${trip.id} could not be evaluated/closed. Recovery financial transaction will continue.`);
+                            }
 
                             // ============================================================
                             // STEP 7: UPDATE AMOUNT TO ALLOCATE FOR REMAINING TRIPS

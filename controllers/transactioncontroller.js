@@ -58,9 +58,10 @@ async function checkAndCloseTrip(connection, tripId) {
             );
             console.log(`Trip ${tripId} status updated to Completed - all payments/recoveries cleared and all fuel sold`);
         }
+        return true;
     } catch (err) {
-        console.error(`Error checking/completing trip ${tripId}:`, err);
-        // Don't throw error, just log it
+        console.error(`[checkAndCloseTrip] Failed for trip ${tripId}:`, err);
+        return false;
     }
 }
 
@@ -670,7 +671,10 @@ exports._addPayment = async (req, res) => {
                     );
 
                     // Check if trip should be closed (all payments cleared and all fuel sold)
-                    await checkAndCloseTrip(connection, trip.id);
+                    const tripCloseResult = await checkAndCloseTrip(connection, trip.id);
+                    if (!tripCloseResult) {
+                        console.warn(`[Trip Status Warning] Trip ${trip.id} could not be evaluated/closed. Payment financial transaction will continue.`);
+                    }
 
                     remainingForTrips -= paymentToApply;
 
@@ -1005,7 +1009,10 @@ exports.addPaymentt = async (req, res) => {
                     tripPaymentAmount -= paymentToApply;
 
                     // Check if trip should be closed
-                    await checkAndCloseTrip(connection, trip.id);
+                    const tripCloseResult = await checkAndCloseTrip(connection, trip.id);
+                    if (!tripCloseResult) {
+                        console.warn(`[Trip Status Warning] Trip ${trip.id} could not be evaluated/closed. Payment financial transaction will continue.`);
+                    }
                 }
 
                 remainingAmount = tripPaymentAmount;
@@ -1417,7 +1424,10 @@ exports.addPayment = async (req, res) => {
                     remainingAmount -= paymentToApply;
 
                     // Check if trip should be closed
-                    await checkAndCloseTrip(connection, trip.trip_id);
+                    const tripCloseResult = await checkAndCloseTrip(connection, trip.trip_id);
+                    if (!tripCloseResult) {
+                        console.warn(`[Trip Status Warning] Trip ${trip.trip_id} could not be evaluated/closed. Payment financial transaction will continue.`);
+                    }
 
                     console.log(`[Bank Payment] ✅ Applied ${paymentToApply} to trip ${trip.trip_no}. Remaining: ${remainingAmount}`);
                 } else {
@@ -3203,7 +3213,10 @@ exports._addCashInHandPayment = async (req, res) => {
                     );
 
                     // Check if trip should be closed (all payments cleared and all fuel sold)
-                    await checkAndCloseTrip(connection, trip.id);
+                    const tripCloseResult = await checkAndCloseTrip(connection, trip.id);
+                    if (!tripCloseResult) {
+                        console.warn(`[Trip Status Warning] Trip ${trip.id} could not be evaluated/closed. Payment financial transaction will continue.`);
+                    }
 
                     remainingPayment -= paymentToApply;
 
@@ -3518,17 +3531,20 @@ exports.addCashInHandPayment = async (req, res) => {
                      WHERE t.status != 'Cancelled'
                        AND t.Active = 1
                        AND (td.payable_amount - COALESCE(td.paid_amount, 0)) > 0
-                     ORDER BY t.start_date ASC, t.id ASC
-                     LIMIT 1`,
+                     ORDER BY t.start_date ASC, t.id ASC`,
                     [DepoID]
                 );
 
-                if (tripsWithBalance.length > 0) {
-                    const trip = tripsWithBalance[0];
-                    const tripRemaining = parseFloat(trip.remaining) || 0;
-                    const paymentToApply = Math.min(remainingAmount, tripRemaining);
+                let tripPaymentAmount = remainingAmount;
+                for (const trip of tripsWithBalance) {
+                    if (tripPaymentAmount <= 0) break;
 
-                    selectedTripId = trip.trip_id;
+                    const tripRemaining = parseFloat(trip.remaining) || 0;
+                    const paymentToApply = Math.min(tripPaymentAmount, tripRemaining);
+
+                    if (!selectedTripId) {
+                        selectedTripId = trip.trip_id;
+                    }
                     hasTripPayment = true;
 
                     // Update trip_depos paid_amount
@@ -3552,14 +3568,21 @@ exports.addCashInHandPayment = async (req, res) => {
                         [parseFloat(tripDeposSum[0]?.total_paid || 0), trip.trip_id]
                     );
 
-                    amountAppliedToTrips = paymentToApply;
-                    remainingAmount -= paymentToApply;
+                    amountAppliedToTrips += paymentToApply;
+                    tripPaymentAmount -= paymentToApply;
 
                     // Check if trip should be closed
-                    await checkAndCloseTrip(connection, trip.trip_id);
+                    const tripCloseResult = await checkAndCloseTrip(connection, trip.trip_id);
+                    if (!tripCloseResult) {
+                        console.warn(`[Trip Status Warning] Trip ${trip.trip_id} could not be evaluated/closed. Payment financial transaction will continue.`);
+                    }
 
-                    console.log(`[Cash Payment] ✅ Applied ${paymentToApply} to trip ${trip.trip_no}. Remaining: ${remainingAmount}`);
-                } else {
+                    console.log(`[Cash Payment] ✅ Applied ${paymentToApply} to trip ${trip.trip_no}. Remaining: ${tripPaymentAmount}`);
+                }
+
+                remainingAmount = tripPaymentAmount;
+
+                if (tripsWithBalance.length === 0) {
                     console.log(`[Cash Payment] No trips with balance found for depo ${DepoID}`);
                 }
             }
@@ -3841,7 +3864,7 @@ exports.addCashInHandPayment = async (req, res) => {
 
             if (hasTripPayment && amountAppliedToTrips > 0) {
                 // Only proceed if there was a trip payment
-                amountToCredit = amountAppliedToTrips;
+                amountToCredit = amountAppliedToTrips + remainingAmount;
 
                 if (creditHeadLower === 'credit') {
                     console.log('[Cash Payment] Crediting trip payment to regular credit limit');
